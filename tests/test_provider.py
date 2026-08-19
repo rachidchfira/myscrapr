@@ -190,6 +190,30 @@ def test_blocking_diagnostics_return_blocked(
     assert result.status == "blocked"
 
 
+def test_429_digits_inside_map_coordinates_do_not_report_blocked(
+    tmp_path: Path,
+    fixture_results_csv: Path,
+) -> None:
+    request = ProviderRequest(
+        business="dentists",
+        location="Ho Chi Minh City",
+        provider_dir=tmp_path / "provider",
+        max_new_records=5,
+    )
+    runner = FakeRunner(
+        writer=copy_fixture(fixture_results_csv),
+        stdout_tail=(
+            '"status":"success","url":"https://www.google.com/maps/place/example/'
+            'data=!3d10.7703556!4d106.6842984","message":"job finished"'
+        ),
+    )
+    provider = GosomDockerProvider(process_runner=runner)
+
+    result = provider.acquire(request, lambda candidate: None)
+
+    assert result.status == "completed"
+
+
 def test_blocked_status_row_returns_blocked(tmp_path: Path) -> None:
     def write(results_path: Path) -> None:
         results_path.parent.mkdir(parents=True, exist_ok=True)

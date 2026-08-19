@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import re
 import subprocess
 import threading
 from contextlib import suppress
@@ -26,7 +27,6 @@ BLOCKING_SIGNALS: Final[tuple[str, ...]] = (
     "unusual traffic",
     "too many requests",
     "rate limit",
-    "429",
 )
 FIELD_ALIASES: Final[dict[str, tuple[str, ...]]] = {
     "place_id": ("place_id", "placeId", "placeid"),
@@ -471,7 +471,16 @@ def _compose_diagnostics(
 
 def _diagnostics_indicate_blocked(diagnostics_tail: str) -> bool:
     normalized = diagnostics_tail.lower()
-    return any(signal in normalized for signal in BLOCKING_SIGNALS)
+    if any(signal in normalized for signal in BLOCKING_SIGNALS):
+        return True
+    return (
+        re.search(
+            r"(?m)(?:^\s*429\s*$|\bhttp(?:/\d(?:\.\d)?)?\s*429\b|"
+            r"\b(?:response\s+)?status(?:\s+code)?\s*[:=]?\s*429\b)",
+            normalized,
+        )
+        is not None
+    )
 
 
 def _csv_error_diagnostic(line_number: int, error: csv.Error) -> str:
