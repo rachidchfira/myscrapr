@@ -316,6 +316,7 @@ class WebsiteEnrichmentService:
         try:
             root_url = _normalize_website(website)
             validated_root = self._url_policy.validate(root_url)
+            _ensure_enrichment_path_allowed(validated_root)
             allowed_domain = registrable_domain(validated_root)
             if allowed_domain is None:
                 raise UnsafeUrlError(f"website must use a registrable domain: {website}")
@@ -352,6 +353,7 @@ class WebsiteEnrichmentService:
         warnings: list[str],
     ) -> FetchedPage | None:
         validated_url = self._url_policy.validate(url, allowed_registrable_domain=allowed_domain)
+        _ensure_enrichment_path_allowed(validated_url)
         if not self._is_allowed_by_robots(validated_url, warnings):
             return None
 
@@ -360,6 +362,7 @@ class WebsiteEnrichmentService:
             page.final_url,
             allowed_registrable_domain=allowed_domain,
         )
+        _ensure_enrichment_path_allowed(final_url)
         if not self._is_allowed_by_robots(final_url, warnings):
             return None
         return FetchedPage(final_url=final_url, html=page.html)
@@ -703,6 +706,11 @@ def _is_filtered_path(path: str) -> bool:
         return True
     segments = {segment for segment in lowered.split("/") if segment}
     return not segments.isdisjoint(_AUTH_PATH_MARKERS)
+
+
+def _ensure_enrichment_path_allowed(url: str) -> None:
+    if _is_filtered_path(urlsplit(url).path):
+        raise UnsafeUrlError(f"website path is not eligible for enrichment: {url}")
 
 
 def _link_priority(text: str, path: str) -> int | None:

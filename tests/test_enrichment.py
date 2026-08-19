@@ -487,6 +487,53 @@ def test_enrichment_accepts_bare_domains_by_normalizing_to_https(policy: UrlPoli
     assert result.emails == ("hello@example.com",)
 
 
+@pytest.mark.parametrize("website", ["https://example.com/brochure.pdf", "https://example.com/login"])
+def test_enrichment_rejects_filtered_root_before_robots_or_fetch(
+    policy: UrlPolicy,
+    website: str,
+) -> None:
+    robots = FakeRobotsChecker()
+    service, fetcher, _, _ = build_service({}, policy=policy, robots_checker=robots)
+
+    result = service.enrich(website)
+
+    assert result.status == EnrichmentStatus.FAILED
+    assert result.emails == ()
+    assert result.error == f"website path is not eligible for enrichment: {website}"
+    assert robots.checked_urls == []
+    assert fetcher.requested_urls == []
+
+
+@pytest.mark.parametrize(
+    ("final_url", "expected_error"),
+    [
+        ("https://example.com/brochure.pdf", "website path is not eligible for enrichment"),
+        ("https://example.com/account", "website path is not eligible for enrichment"),
+    ],
+)
+def test_enrichment_rejects_filtered_redirect_target_before_content_use(
+    policy: UrlPolicy,
+    final_url: str,
+    expected_error: str,
+) -> None:
+    robots = FakeRobotsChecker()
+    service, fetcher, _, _ = build_service(
+        {
+            "https://example.com": FetchedPage(final_url=final_url, html="<p>should not be used</p>"),
+        },
+        policy=policy,
+        robots_checker=robots,
+    )
+
+    result = service.enrich("https://example.com")
+
+    assert result.status == EnrichmentStatus.FAILED
+    assert result.emails == ()
+    assert expected_error in (result.error or "")
+    assert robots.checked_urls == ["https://example.com"]
+    assert fetcher.requested_urls == ["https://example.com"]
+
+
 def test_discovery_restricts_to_contact_about_team_links_only() -> None:
     discovered = _discover_candidate_pages(
         "https://example.com",
