@@ -66,7 +66,7 @@ Check quota at any time:
 .venv/bin/mapslead --data-dir ./data quota
 ```
 
-Resume a blocked or partial run:
+Resume a blocked, partial, or failed run:
 
 ```bash
 .venv/bin/mapslead --data-dir ./data --export-dir ./exports resume <run-id>

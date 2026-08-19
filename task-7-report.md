@@ -59,7 +59,7 @@ RED:
 Automated:
 
 - `.venv/bin/python -m pytest -q`
-  - Result: `104 passed`
+  - Result at Task 7 implementation: `104 passed`; final integrated branch verification: `114 passed`
 - `.venv/bin/python -m ruff check .`
   - Result: success
 - `.venv/bin/python -m mypy src/mapslead`
