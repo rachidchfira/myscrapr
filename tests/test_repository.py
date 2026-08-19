@@ -198,7 +198,106 @@ def test_pending_enrichment_uses_canonical_website_learned_later_in_same_run(
 
     assert [item.business_id for item in pending] == [first.business_id]
     assert pending[0].website == "https://example.com"
-    assert snapshot.website is None
+    assert snapshot.website == "https://example.com"
+
+
+def test_same_run_website_change_updates_snapshot_and_resets_completed_enrichment(
+    repository: SQLiteRepository,
+    now: datetime,
+) -> None:
+    run = repository.create_run("dentists", "HCMC", 10, now)
+    first = repository.accept_candidate(
+        run.id,
+        ProviderCandidate(
+            name="Example Dental",
+            place_id="ChIJ-123",
+            website="https://old.example.com",
+        ),
+        now,
+    )
+    repository.save_enrichment(
+        run.id,
+        first.business_id,
+        EnrichmentResult(
+            status=EnrichmentStatus.COMPLETED,
+            emails=("old@example.com",),
+        ),
+        now,
+    )
+    repository.save_cached_enrichment(
+        first.business_id,
+        "https://old.example.com",
+        EnrichmentResult(
+            status=EnrichmentStatus.COMPLETED,
+            emails=("old@example.com",),
+        ),
+        now,
+    )
+
+    later = now.replace(hour=11)
+    repository.accept_candidate(
+        run.id,
+        ProviderCandidate(
+            name="Example Dental",
+            place_id="ChIJ-123",
+            website="https://new.example.com",
+        ),
+        later,
+    )
+
+    snapshot = repository.snapshots_for_run(run.id)[0]
+    pending = repository.pending_enrichment(run.id)
+
+    assert snapshot.website == "https://new.example.com"
+    assert snapshot.last_seen_at == later
+    assert snapshot.enrichment_status is EnrichmentStatus.PENDING
+    assert snapshot.emails == ()
+    assert [item.business_id for item in pending] == [first.business_id]
+    assert pending[0].website == "https://new.example.com"
+
+
+def test_same_run_normalization_equivalent_website_preserves_completed_enrichment(
+    repository: SQLiteRepository,
+    now: datetime,
+) -> None:
+    run = repository.create_run("dentists", "HCMC", 10, now)
+    first = repository.accept_candidate(
+        run.id,
+        ProviderCandidate(
+            name="Example Dental",
+            place_id="ChIJ-123",
+            website="https://example.com",
+        ),
+        now,
+    )
+    repository.save_enrichment(
+        run.id,
+        first.business_id,
+        EnrichmentResult(
+            status=EnrichmentStatus.COMPLETED,
+            emails=("kept@example.com",),
+        ),
+        now,
+    )
+
+    later = now.replace(hour=11)
+    repository.accept_candidate(
+        run.id,
+        ProviderCandidate(
+            name="Example Dental",
+            place_id="ChIJ-123",
+            website="HTTPS://EXAMPLE.COM:443/#team",
+        ),
+        later,
+    )
+
+    snapshot = repository.snapshots_for_run(run.id)[0]
+
+    assert snapshot.website == "HTTPS://EXAMPLE.COM:443/#team"
+    assert snapshot.last_seen_at == later
+    assert snapshot.enrichment_status is EnrichmentStatus.COMPLETED
+    assert snapshot.emails == ("kept@example.com",)
+    assert repository.pending_enrichment(run.id) == ()
 
 
 def test_pending_enrichment_uses_canonical_website_for_later_run_reuse_without_mutating_older_snapshot(

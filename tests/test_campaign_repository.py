@@ -514,6 +514,27 @@ def test_campaign_snapshots_use_latest_campaign_snapshot_and_canonical_enrichmen
     assert snapshots[0].enrichment_status is EnrichmentStatus.PENDING
 
 
+def test_campaign_snapshots_use_campaign_business_type_display(
+    repository: SQLiteRepository,
+    now: datetime,
+) -> None:
+    campaign = repository.create_campaign("vietnam-dentists", "  Dentists  ", now)
+    run = repository.create_run("dentists", "Da Nang", 10, now, campaign_slug=campaign.slug)
+    repository.accept_candidate(
+        run.id,
+        ProviderCandidate(
+            name="Example Dental",
+            place_id="ChIJ-123",
+            website="https://example.com",
+        ),
+        now,
+    )
+
+    snapshot = repository.campaign_snapshots(campaign.slug)[0]
+
+    assert snapshot.business_type == "  Dentists  "
+
+
 def test_campaign_membership_timestamps_start_at_first_campaign_discovery_for_reused_business(
     repository: SQLiteRepository,
 ) -> None:

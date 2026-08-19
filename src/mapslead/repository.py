@@ -480,7 +480,7 @@ class SQLiteRepository:
                     campaign_id=campaign.slug,
                     discovered_in=discovered_in,
                     name=canonical.name or latest_snapshot.name,
-                    business_type=latest_snapshot.business_type,
+                    business_type=campaign.business_type,
                     first_seen_at=_parse_datetime(str(membership_rows[0]["first_discovered_at"])),
                     last_seen_at=_parse_datetime(str(membership_rows[0]["last_discovered_at"])),
                     place_id=canonical.place_id,
@@ -1003,7 +1003,55 @@ class SQLiteRepository:
             (run.id, business_id),
         ).fetchone()
         if row is not None:
-            return RunSnapshot.model_validate_json(str(row["snapshot_json"]))
+            existing = RunSnapshot.model_validate_json(str(row["snapshot_json"]))
+            updated = existing.model_copy(
+                update={
+                    "name": _prefer_candidate_value(candidate.name, existing.name),
+                    "category": _prefer_candidate_value(candidate.category, existing.category),
+                    "address": _prefer_candidate_value(candidate.address, existing.address),
+                    "phone": _prefer_candidate_value(candidate.phone, existing.phone),
+                    "website": _prefer_candidate_value(candidate.website, existing.website),
+                    "rating": candidate.rating if candidate.rating is not None else existing.rating,
+                    "review_count": (
+                        candidate.review_count
+                        if candidate.review_count is not None
+                        else existing.review_count
+                    ),
+                    "google_maps_url": _prefer_candidate_value(
+                        candidate.google_maps_url,
+                        existing.google_maps_url,
+                    ),
+                    "last_seen_at": last_seen_at,
+                }
+            )
+            if _normalized_website_changed(existing.website, updated.website):
+                updated = updated.model_copy(
+                    update={
+                        "emails": (),
+                        "facebook_url": None,
+                        "instagram_url": None,
+                        "linkedin_url": None,
+                        "x_url": None,
+                        "youtube_url": None,
+                        "enrichment_status": EnrichmentStatus.PENDING,
+                        "enrichment_error": None,
+                    }
+                )
+            connection.execute(
+                """
+                UPDATE run_businesses
+                SET snapshot_json = ?, enrichment_status = ?, enrichment_error = ?
+                WHERE run_id = ? AND business_id = ?
+                """,
+                (
+                    updated.model_dump_json(),
+                    updated.enrichment_status.value,
+                    updated.enrichment_error,
+                    run.id,
+                    business_id,
+                ),
+            )
+            return updated
 
         snapshot = RunSnapshot(
             business_id=business_id,
@@ -1150,6 +1198,10 @@ def _parse_datetime(value: str) -> datetime:
 
 def _prefer_candidate_value(candidate_value: str | None, current_value: str | None) -> str | None:
     return candidate_value if candidate_value is not None else current_value
+
+
+def _normalized_website_changed(previous: str | None, current: str | None) -> bool:
+    return normalize_website_url(previous) != normalize_website_url(current)
 
 
 def _require_row(row: sqlite3.Row | None, label: str) -> sqlite3.Row:
