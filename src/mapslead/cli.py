@@ -9,11 +9,12 @@ from typing import Any
 
 import typer
 
+from mapslead.campaign_exporter import CampaignExporter
 from mapslead.config import DAILY_NEW_RECORD_LIMIT, DEFAULT_RUN_LIMIT, Settings
 from mapslead.enrichment import WebsiteEnrichmentService
 from mapslead.errors import MapsLeadError
 from mapslead.exporter import Exporter
-from mapslead.models import ExportPaths, ProgressEvent, RunStatus
+from mapslead.models import CampaignStatus, ExportPaths, ProgressEvent, RunStatus
 from mapslead.provider import GosomDockerProvider
 from mapslead.repository import SQLiteRepository
 from mapslead.service import MapsLeadService, RequestedLimitError, ResumeNotAllowedError
@@ -29,6 +30,8 @@ app = typer.Typer(
     no_args_is_help=True,
     context_settings={"help_option_names": ["-h", "--help"]},
 )
+campaign_app = typer.Typer(no_args_is_help=True)
+app.add_typer(campaign_app, name="campaign")
 DATA_DIR_OPTION = typer.Option(
     None,
     "--data-dir",
@@ -48,6 +51,7 @@ EXPORT_DIR_OPTION = typer.Option(
     help="Directory for per-run CSV and JSON exports.",
 )
 BUSINESS_OPTION = typer.Option(..., "--business", help="Business type to search for.")
+CAMPAIGN_OPTION = typer.Option(None, "--campaign", help="Campaign slug to scrape into.")
 LOCATION_OPTION = typer.Option(..., "--location", help="Location query to search in.")
 LIMIT_OPTION = typer.Option(
     DEFAULT_RUN_LIMIT,
@@ -56,6 +60,11 @@ LIMIT_OPTION = typer.Option(
     help="Maximum number of new unique records to accept for this run.",
 )
 EXPORT_RUN_ID_OPTION = typer.Option(..., "--run-id", help="Existing run identifier to export.")
+REFRESH_ENRICHMENT_OPTION = typer.Option(
+    False,
+    "--refresh-enrichment",
+    help="Force website enrichment even when a matching successful cache exists.",
+)
 
 
 class PrerequisiteError(MapsLeadError):
@@ -76,6 +85,7 @@ class AppRuntime:
     repository: Any
     service: Any
     exporter: Any
+    campaign_exporter: Any
     clock: Any
     prerequisite_checker: Any
 
@@ -114,6 +124,7 @@ def build_service(settings: Settings) -> AppRuntime:
     repository = SQLiteRepository(settings)
     repository.initialize()
     exporter = Exporter(repository, settings)
+    campaign_exporter = CampaignExporter(repository, settings)
     service = MapsLeadService(
         repository=repository,
         provider=GosomDockerProvider(),
@@ -125,6 +136,7 @@ def build_service(settings: Settings) -> AppRuntime:
         repository=repository,
         service=service,
         exporter=exporter,
+        campaign_exporter=campaign_exporter,
         clock=SystemClock(),
         prerequisite_checker=OperatorPrerequisiteChecker().check,
     )
@@ -142,19 +154,34 @@ def main(
 @app.command()
 def scrape(
     ctx: typer.Context,
-    business: str = BUSINESS_OPTION,
+    business: str | None = typer.Option(None, "--business", help="Business type to search for."),
+    campaign: str | None = CAMPAIGN_OPTION,
     location: str = LOCATION_OPTION,
     limit: int = LIMIT_OPTION,
+    refresh_enrichment: bool = REFRESH_ENRICHMENT_OPTION,
 ) -> None:
     runtime = _runtime_for_context(ctx)
+    if (business is None) == (campaign is None):
+        _exit_with_message("exactly one of --business and --campaign is required", code=2)
+
+    resolved_business = business
+    if campaign is not None:
+        try:
+            resolved_business = runtime.repository.get_campaign(campaign).business_type
+        except (MapsLeadError, KeyError) as exc:
+            _exit_with_message(_message_for_exception(exc), code=1)
+
+    assert resolved_business is not None
     _run_with_prerequisites(runtime.prerequisite_checker)
     try:
         outcome = runtime.service.scrape(
-            business,
+            resolved_business,
             location,
             limit,
             runtime.clock.now(),
             _progress_renderer(),
+            campaign_slug=campaign,
+            refresh_enrichment=refresh_enrichment,
         )
     except RequestedLimitError as exc:
         _exit_with_message(_message_for_exception(exc), code=2)
@@ -199,6 +226,55 @@ def export(
     _render_export_paths(paths)
 
 
+@campaign_app.command("create")
+def create_campaign(
+    ctx: typer.Context,
+    slug: str,
+    business: str = BUSINESS_OPTION,
+) -> None:
+    runtime = _runtime_for_context(ctx)
+    try:
+        campaign = runtime.repository.create_campaign(slug, business, runtime.clock.now())
+    except (MapsLeadError, KeyError) as exc:
+        _exit_with_message(_message_for_exception(exc), code=1)
+    typer.echo(f"Campaign: {campaign.slug}")
+    typer.echo(f"Business type: {campaign.business_type}")
+
+
+@campaign_app.command("attach-run")
+def attach_campaign_run(
+    ctx: typer.Context,
+    slug: str,
+    run_id: str,
+) -> None:
+    runtime = _runtime_for_context(ctx)
+    try:
+        campaign = runtime.repository.attach_run(slug, run_id, runtime.clock.now())
+    except (MapsLeadError, KeyError) as exc:
+        _exit_with_message(_message_for_exception(exc), code=1)
+    typer.echo(f"Attached {run_id} to {campaign.slug}")
+
+
+@campaign_app.command("status")
+def campaign_status(ctx: typer.Context, slug: str) -> None:
+    runtime = _runtime_for_context(ctx)
+    try:
+        status = runtime.repository.campaign_status(slug)
+    except (MapsLeadError, KeyError) as exc:
+        _exit_with_message(_message_for_exception(exc), code=1)
+    _render_campaign_status(runtime, status)
+
+
+@campaign_app.command("export")
+def export_campaign(ctx: typer.Context, slug: str) -> None:
+    runtime = _runtime_for_context(ctx)
+    try:
+        paths = runtime.campaign_exporter.export_campaign(slug)
+    except (MapsLeadError, KeyError) as exc:
+        _exit_with_message(_message_for_exception(exc), code=1)
+    _render_export_paths(paths)
+
+
 def _resolve_settings(*, data_dir: Path | None, export_dir: Path | None) -> Settings:
     base_settings = Settings.from_env()
     return Settings(
@@ -209,7 +285,7 @@ def _resolve_settings(*, data_dir: Path | None, export_dir: Path | None) -> Sett
 
 
 def _runtime_for_context(ctx: typer.Context) -> AppRuntime:
-    settings = ctx.obj
+    settings = ctx.find_root().obj
     if not isinstance(settings, Settings):
         settings = _resolve_settings(data_dir=None, export_dir=None)
     return build_service(settings)
@@ -250,6 +326,11 @@ def _progress_renderer() -> Any:
         if event.kind == "enrichment":
             typer.echo(f"Enriched {event.completed_count or 0}/{event.total_count or 0} websites.")
             return
+        if event.kind == "enrichment_reused":
+            typer.echo(
+                f"Reused cached enrichment {event.completed_count or 0}/{event.total_count or 0}."
+            )
+            return
         if event.kind == "export" and event.export_paths is not None:
             _render_export_paths(event.export_paths)
 
@@ -270,6 +351,29 @@ def _render_outcome(outcome: Any) -> None:
 def _render_export_paths(paths: ExportPaths) -> None:
     typer.echo(f"CSV: {paths.csv_path}")
     typer.echo(f"JSON: {paths.json_path}")
+
+
+def _render_campaign_status(runtime: AppRuntime, status: CampaignStatus) -> None:
+    remaining = runtime.repository.remaining_quota(runtime.clock.now())
+    used = DAILY_NEW_RECORD_LIMIT - remaining
+    typer.echo(f"Campaign: {status.campaign.slug}")
+    typer.echo(f"Business type: {status.campaign.business_type}")
+    typer.echo(f"Runs: {status.run_count}")
+    typer.echo(f"Businesses: {status.business_count}")
+    typer.echo(f"Locations: {', '.join(status.discovered_in) if status.discovered_in else '-'}")
+    typer.echo(
+        "Enrichment: "
+        f"{status.completed_count} completed, "
+        f"{status.failed_count} failed, "
+        f"{status.skipped_count} skipped, "
+        f"{status.pending_count} pending"
+    )
+    typer.echo(f"Used today: {used}")
+    typer.echo(f"Remaining: {remaining}")
+    csv_path = runtime.settings.export_dir / "campaigns" / status.campaign.slug / "results.csv"
+    json_path = runtime.settings.export_dir / "campaigns" / status.campaign.slug / "results.json"
+    if csv_path.exists() and json_path.exists():
+        _render_export_paths(ExportPaths(csv_path=csv_path, json_path=json_path))
 
 
 def _message_for_exception(error: BaseException) -> str:

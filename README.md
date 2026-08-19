@@ -1,6 +1,6 @@
 # MapsLead
 
-MapsLead is a local CLI for collecting Google Maps lead candidates, enriching business websites, and exporting each run as CSV and JSON.
+MapsLead is a local CLI for collecting Google Maps lead candidates, enriching business websites, and exporting each run as CSV and JSON. It also supports isolated nationwide campaigns so you can scrape one niche across many cities without mixing business types or exporting the same business twice.
 
 ## Requirements
 
@@ -27,9 +27,14 @@ Global options:
 Main commands:
 
 - `mapslead scrape --business TEXT --location TEXT [--limit INTEGER]`
+- `mapslead scrape --campaign SLUG --location TEXT [--limit INTEGER] [--refresh-enrichment]`
 - `mapslead quota`
 - `mapslead resume RUN_ID`
 - `mapslead export --run-id RUN_ID`
+- `mapslead campaign create SLUG --business TEXT`
+- `mapslead campaign attach-run SLUG RUN_ID`
+- `mapslead campaign status SLUG`
+- `mapslead campaign export SLUG`
 
 ## First Run
 
@@ -51,7 +56,30 @@ Progress output stays concise:
 
 - acquisition updates show accepted candidate and new-unique counts
 - enrichment updates show completed website enrichments
+- cached-enrichment updates show reuse without refetching a website
 - export updates print the final CSV and JSON paths
+
+## Campaign Workflow
+
+Campaigns isolate one normalized business type, keep deduplication and quota global, and write one master CSV/JSON pair per campaign under `exports/campaigns/<slug>/`.
+
+Use this workflow for the Vietnam dentist campaign:
+
+```bash
+.venv/bin/mapslead campaign create vietnam-dentists --business dentists
+.venv/bin/mapslead campaign attach-run vietnam-dentists 6f8d2ee1d37b44d7be6ce2413c0da825
+.venv/bin/mapslead scrape --campaign vietnam-dentists --location Hanoi --limit 300
+.venv/bin/mapslead campaign status vietnam-dentists
+.venv/bin/mapslead campaign export vietnam-dentists
+```
+
+Rules that stay in force:
+
+- Campaigns are explicit. A run is either attached to one campaign or to none.
+- The daily `1000` new-unique quota stays global across campaign and non-campaign runs.
+- Successful website enrichment is reused while the normalized website URL stays the same.
+- `--refresh-enrichment` forces website refetching for that run and stays persisted for resume.
+- Campaign master exports are written to `exports/campaigns/<slug>/results.csv` and `results.json`.
 
 ## Quota And Storage
 
@@ -59,6 +87,8 @@ Progress output stays concise:
 - The default requested limit is `200`.
 - SQLite state lives under `data/mapslead.sqlite3` unless you override `--data-dir` or `MAPSLEAD_DATA_DIR`.
 - Per-run exports live under `exports/<run-id>/results.csv` and `exports/<run-id>/results.json` unless you override `--export-dir` or `MAPSLEAD_EXPORT_DIR`.
+- Campaign exports live under `exports/campaigns/<slug>/results.csv` and `exports/campaigns/<slug>/results.json`.
+- `data/` and `exports/` are local working directories and are not intended to be pushed to GitHub.
 
 Check quota at any time:
 
@@ -95,6 +125,7 @@ These commands were verified in this repository on August 19, 2026:
 .venv/bin/python -m mypy src/mapslead
 .venv/bin/python -m build
 .venv/bin/mapslead --help
+.venv/bin/mapslead campaign --help
 .venv/bin/mapslead scrape --help
 .venv/bin/mapslead --data-dir /tmp/mapslead-help-data quota
 .venv/bin/mapslead resume --help

@@ -16,6 +16,8 @@ from mapslead.config import DAILY_NEW_RECORD_LIMIT, DEFAULT_RUN_LIMIT, Settings
 from mapslead.enrichment import FetchedPage, UrlPolicy, WebsiteEnrichmentService
 from mapslead.exporter import Exporter
 from mapslead.models import (
+    CampaignRecord,
+    CampaignStatus,
     EnrichmentStatus,
     ExportPaths,
     ProgressEvent,
@@ -47,6 +49,12 @@ class FakeRepository:
     remaining_quota_value: int = DAILY_NEW_RECORD_LIMIT
     remaining_quota_calls: list[datetime] = field(default_factory=list)
     runs_by_id: dict[str, RunRecord] = field(default_factory=dict)
+    campaigns_by_slug: dict[str, CampaignRecord] = field(default_factory=dict)
+    campaign_statuses: dict[str, CampaignStatus] = field(default_factory=dict)
+    create_campaign_calls: list[tuple[str, str, datetime]] = field(default_factory=list)
+    attach_run_calls: list[tuple[str, str, datetime]] = field(default_factory=list)
+    get_campaign_calls: list[str] = field(default_factory=list)
+    campaign_status_calls: list[str] = field(default_factory=list)
 
     def initialize(self) -> None:
         return None
@@ -60,6 +68,28 @@ class FakeRepository:
             raise KeyError(f"run {run_id} not found")
         return self.runs_by_id[run_id]
 
+    def create_campaign(self, slug: str, business: str, now: datetime) -> CampaignRecord:
+        self.create_campaign_calls.append((slug, business, now))
+        record = CampaignRecord(slug=slug, business_type=business, created_at=now)
+        self.campaigns_by_slug[slug] = record
+        return record
+
+    def get_campaign(self, slug: str) -> CampaignRecord:
+        self.get_campaign_calls.append(slug)
+        if slug not in self.campaigns_by_slug:
+            raise KeyError(f"campaign {slug} not found")
+        return self.campaigns_by_slug[slug]
+
+    def attach_run(self, slug: str, run_id: str, now: datetime) -> CampaignRecord:
+        self.attach_run_calls.append((slug, run_id, now))
+        return self.get_campaign(slug)
+
+    def campaign_status(self, slug: str) -> CampaignStatus:
+        self.campaign_status_calls.append(slug)
+        if slug not in self.campaign_statuses:
+            raise KeyError(f"campaign {slug} not found")
+        return self.campaign_statuses[slug]
+
 
 @dataclass(slots=True)
 class FakeExporter:
@@ -72,12 +102,23 @@ class FakeExporter:
 
 
 @dataclass(slots=True)
+class FakeCampaignExporter:
+    paths: ExportPaths
+    calls: list[str] = field(default_factory=list)
+
+    def export_campaign(self, slug: str) -> ExportPaths:
+        self.calls.append(slug)
+        return self.paths
+
+
+@dataclass(slots=True)
 class FakeService:
     outcome: RunOutcome
     progress_events: tuple[ProgressEvent, ...] = ()
     scrape_error: Exception | None = None
     resume_error: Exception | None = None
     scrape_call: tuple[str, str, int] | None = None
+    scrape_options: dict[str, Any] | None = None
     resume_call: str | None = None
 
     def scrape(
@@ -87,8 +128,15 @@ class FakeService:
         limit: int,
         now: datetime,
         progress: Callable[[ProgressEvent], None],
+        *,
+        campaign_slug: str | None = None,
+        refresh_enrichment: bool = False,
     ) -> RunOutcome:
         self.scrape_call = (business, location, limit)
+        self.scrape_options = {
+            "campaign_slug": campaign_slug,
+            "refresh_enrichment": refresh_enrichment,
+        }
         for event in self.progress_events:
             progress(event)
         if self.scrape_error is not None:
@@ -110,6 +158,7 @@ class FakeRuntime:
     repository: Any
     service: Any
     exporter: Any
+    campaign_exporter: Any
     clock: FakeClock
     prerequisite_checker: Callable[[], None] = lambda: None
 
@@ -229,11 +278,18 @@ def _runtime(tmp_path: Path, *, service: Any, repository: Any | None = None, exp
     settings = Settings(data_dir=tmp_path / "data", export_dir=tmp_path / "exports")
     active_repository = repository or FakeRepository(runs_by_id={"run-123": _run_record("run-123")})
     active_exporter = exporter or FakeExporter(_export_paths("run-123"))
+    active_campaign_exporter = FakeCampaignExporter(
+        ExportPaths(
+            csv_path=Path("/tmp/exports/campaigns/vietnam-dentists/results.csv"),
+            json_path=Path("/tmp/exports/campaigns/vietnam-dentists/results.json"),
+        )
+    )
     return FakeRuntime(
         settings=settings,
         repository=active_repository,
         service=service,
         exporter=active_exporter,
+        campaign_exporter=active_campaign_exporter,
         clock=FakeClock(),
     )
 
@@ -274,6 +330,149 @@ def test_scrape_command_uses_default_limit_when_not_provided(
 
     assert result.exit_code == 0
     assert runtime.service.scrape_call == ("dentists", "HCMC", DEFAULT_RUN_LIMIT)
+
+
+def test_scrape_campaign_uses_locked_business_type_before_prerequisites(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checker = CountingChecker()
+    repository = FakeRepository(
+        campaigns_by_slug={
+            "vietnam-dentists": CampaignRecord(
+                slug="vietnam-dentists",
+                business_type="dentists",
+                created_at=FakeClock().now(),
+            )
+        }
+    )
+    runtime = _runtime(
+        tmp_path,
+        repository=repository,
+        service=FakeService(outcome=_outcome("run-123")),
+    )
+    runtime.prerequisite_checker = checker
+    _patch_runtime(monkeypatch, runtime)
+
+    result = runner.invoke(
+        cli.app,
+        ["scrape", "--campaign", "vietnam-dentists", "--location", "Hanoi", "--limit", "25"],
+    )
+
+    assert result.exit_code == 0
+    assert repository.get_campaign_calls == ["vietnam-dentists"]
+    assert checker.calls == 1
+    assert runtime.service.scrape_call == ("dentists", "Hanoi", 25)
+    assert runtime.service.scrape_options == {
+        "campaign_slug": "vietnam-dentists",
+        "refresh_enrichment": False,
+    }
+
+
+def test_scrape_rejects_missing_and_duplicate_business_campaign_inputs_without_prerequisites(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checker = CountingChecker()
+    repository = FakeRepository(
+        campaigns_by_slug={
+            "vietnam-dentists": CampaignRecord(
+                slug="vietnam-dentists",
+                business_type="dentists",
+                created_at=FakeClock().now(),
+            )
+        }
+    )
+    runtime = _runtime(
+        tmp_path,
+        repository=repository,
+        service=FakeService(outcome=_outcome("run-123")),
+    )
+    runtime.prerequisite_checker = checker
+    _patch_runtime(monkeypatch, runtime)
+
+    missing = runner.invoke(cli.app, ["scrape", "--location", "Hanoi"])
+    duplicate = runner.invoke(
+        cli.app,
+        [
+            "scrape",
+            "--business",
+            "dentists",
+            "--campaign",
+            "vietnam-dentists",
+            "--location",
+            "Hanoi",
+        ],
+    )
+
+    assert missing.exit_code == 2
+    assert duplicate.exit_code == 2
+    assert "exactly one of --business and --campaign is required" in missing.stdout
+    assert "exactly one of --business and --campaign is required" in duplicate.stdout
+    assert checker.calls == 0
+
+
+def test_scrape_campaign_missing_campaign_reports_before_prerequisites(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checker = CountingChecker()
+    repository = FakeRepository()
+    runtime = _runtime(
+        tmp_path,
+        repository=repository,
+        service=FakeService(outcome=_outcome("run-123")),
+    )
+    runtime.prerequisite_checker = checker
+    _patch_runtime(monkeypatch, runtime)
+
+    result = runner.invoke(
+        cli.app,
+        ["scrape", "--campaign", "missing-campaign", "--location", "Hanoi"],
+    )
+
+    assert result.exit_code == 1
+    assert "campaign missing-campaign not found" in result.stdout
+    assert checker.calls == 0
+
+
+def test_scrape_campaign_passes_refresh_enrichment_flag(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = FakeRepository(
+        campaigns_by_slug={
+            "vietnam-dentists": CampaignRecord(
+                slug="vietnam-dentists",
+                business_type="dentists",
+                created_at=FakeClock().now(),
+            )
+        }
+    )
+    runtime = _runtime(
+        tmp_path,
+        repository=repository,
+        service=FakeService(outcome=_outcome("run-123")),
+    )
+    _patch_runtime(monkeypatch, runtime)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "scrape",
+            "--campaign",
+            "vietnam-dentists",
+            "--location",
+            "Hanoi",
+            "--refresh-enrichment",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert runtime.service.scrape_options == {
+        "campaign_slug": "vietnam-dentists",
+        "refresh_enrichment": True,
+    }
 
 
 def test_quota_command_reports_used_and_remaining(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -327,6 +526,118 @@ def test_export_command_regenerates_exports(tmp_path: Path, monkeypatch: pytest.
     assert result.exit_code == 0
     assert exporter.calls == ["run-789"]
     assert "results.csv" in result.stdout
+
+
+def test_campaign_create_attach_status_and_export_skip_prerequisite_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checker = CountingChecker()
+    clock = FakeClock()
+    campaign = CampaignRecord(
+        slug="vietnam-dentists",
+        business_type="dentists",
+        created_at=clock.now(),
+    )
+    repository = FakeRepository(
+        campaigns_by_slug={"vietnam-dentists": campaign},
+        runs_by_id={"run-123": _run_record("run-123")},
+        campaign_statuses={
+            "vietnam-dentists": CampaignStatus(
+                campaign=campaign,
+                run_count=2,
+                business_count=3,
+                discovered_in=("Hanoi", "Ho Chi Minh City"),
+                completed_count=1,
+                failed_count=1,
+                skipped_count=0,
+                pending_count=1,
+            )
+        },
+        remaining_quota_value=997,
+    )
+    runtime = _runtime(
+        tmp_path,
+        repository=repository,
+        service=FakeService(outcome=_outcome("run-123")),
+    )
+    runtime.clock = clock
+    runtime.prerequisite_checker = checker
+    captured_settings = _patch_runtime(monkeypatch, runtime)
+    cli_data_dir = tmp_path / "campaign-data"
+    cli_export_dir = tmp_path / "campaign-exports"
+
+    create_result = runner.invoke(
+        cli.app,
+        [
+            "--data-dir",
+            str(cli_data_dir),
+            "--export-dir",
+            str(cli_export_dir),
+            "campaign",
+            "create",
+            "vietnam-dentists",
+            "--business",
+            "dentists",
+        ],
+    )
+    attach_result = runner.invoke(
+        cli.app,
+        [
+            "--data-dir",
+            str(cli_data_dir),
+            "--export-dir",
+            str(cli_export_dir),
+            "campaign",
+            "attach-run",
+            "vietnam-dentists",
+            "run-123",
+        ],
+    )
+    status_result = runner.invoke(
+        cli.app,
+        [
+            "--data-dir",
+            str(cli_data_dir),
+            "--export-dir",
+            str(cli_export_dir),
+            "campaign",
+            "status",
+            "vietnam-dentists",
+        ],
+    )
+    export_result = runner.invoke(
+        cli.app,
+        [
+            "--data-dir",
+            str(cli_data_dir),
+            "--export-dir",
+            str(cli_export_dir),
+            "campaign",
+            "export",
+            "vietnam-dentists",
+        ],
+    )
+
+    assert create_result.exit_code == 0
+    assert attach_result.exit_code == 0
+    assert status_result.exit_code == 0
+    assert export_result.exit_code == 0
+    assert checker.calls == 0
+    assert repository.create_campaign_calls == [("vietnam-dentists", "dentists", clock.now())]
+    assert repository.attach_run_calls == [("vietnam-dentists", "run-123", clock.now())]
+    assert "Campaign: vietnam-dentists" in status_result.stdout
+    assert "Businesses: 3" in status_result.stdout
+    assert "Locations: Hanoi, Ho Chi Minh City" in status_result.stdout
+    assert "Remaining: 997" in status_result.stdout
+    assert "campaigns/vietnam-dentists/results.csv" in export_result.stdout
+    assert captured_settings == [
+        Settings(
+            data_dir=cli_data_dir,
+            export_dir=cli_export_dir,
+            timezone=Settings.from_env().timezone,
+        )
+    ] * 4
 
 
 @pytest.mark.parametrize(
@@ -501,6 +812,7 @@ def test_scrape_reports_prerequisite_guidance_without_creating_a_run(
         repository=repository,
         service=service,
         exporter=exporter,
+        campaign_exporter=FakeCampaignExporter(_export_paths("vietnam-dentists")),
         clock=FakeClock(),
         prerequisite_checker=lambda: _raise_prerequisite("Docker is unavailable. Install and start Docker, then retry."),
     )
@@ -668,6 +980,7 @@ def test_offline_end_to_end_scrape_quota_and_reexport_are_stable(
         repository=repository,
         service=service,
         exporter=exporter,
+        campaign_exporter=FakeCampaignExporter(_export_paths("vietnam-dentists")),
         clock=FakeClock(),
     )
     _patch_runtime(monkeypatch, runtime)
