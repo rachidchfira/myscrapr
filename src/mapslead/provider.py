@@ -22,6 +22,7 @@ def _canonicalize(value: str) -> str:
 
 MAX_CSV_FIELD_SIZE: Final[int] = 1_000_000
 DIAGNOSTIC_TAIL_LIMIT: Final[int] = 4_000
+RESULTS_PER_DEPTH: Final[int] = 20
 BLOCKING_SIGNALS: Final[tuple[str, ...]] = (
     "captcha",
     "unusual traffic",
@@ -180,7 +181,14 @@ class GosomDockerProvider(MapsProvider):
             encoding="utf-8",
         )
 
-        outcome = self._process_runner.run(_docker_args(queries_path, out_dir), attempt_dir)
+        outcome = self._process_runner.run(
+            _docker_args(
+                queries_path,
+                out_dir,
+                max_new_records=request.max_new_records,
+            ),
+            attempt_dir,
+        )
         ingest_result = _ingest_results(out_dir / "results.csv", sink)
         diagnostics_tail = _compose_diagnostics(
             outcome.stdout_tail,
@@ -252,7 +260,11 @@ def _close_stream(stream: IO[str] | None) -> None:
         stream.close()
 
 
-def _docker_args(queries_path: Path, out_dir: Path) -> list[str]:
+def _docker_depth(max_new_records: int) -> int:
+    return max(1, (max_new_records + RESULTS_PER_DEPTH - 1) // RESULTS_PER_DEPTH)
+
+
+def _docker_args(queries_path: Path, out_dir: Path, *, max_new_records: int) -> list[str]:
     return [
         "docker",
         "run",
@@ -267,7 +279,7 @@ def _docker_args(queries_path: Path, out_dir: Path) -> list[str]:
         "-results",
         "/out/results.csv",
         "-depth",
-        "1",
+        str(_docker_depth(max_new_records)),
         "-c",
         "1",
         "-exit-on-inactivity",

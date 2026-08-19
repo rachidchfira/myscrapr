@@ -66,15 +66,28 @@ def collect_candidates() -> tuple[list[ProviderCandidate], Callable[[ProviderCan
     return candidates, sink
 
 
+@pytest.mark.parametrize(
+    ("requested_limit", "expected_depth"),
+    [
+        (5, 1),
+        (20, 1),
+        (21, 2),
+        (100, 5),
+        (250, 13),
+        (1000, 50),
+    ],
+)
 def test_acquire_runs_docker_with_expected_args_and_query_file(
     tmp_path: Path,
     fixture_results_csv: Path,
+    requested_limit: int,
+    expected_depth: int,
 ) -> None:
     request = ProviderRequest(
         business="dentists",
         location="Ho Chi Minh City",
         provider_dir=tmp_path / "provider",
-        max_new_records=25,
+        max_new_records=requested_limit,
     )
     runner = FakeRunner(writer=copy_fixture(fixture_results_csv))
     provider = GosomDockerProvider(process_runner=runner)
@@ -105,7 +118,7 @@ def test_acquire_runs_docker_with_expected_args_and_query_file(
         "-results",
         "/out/results.csv",
         "-depth",
-        "1",
+        str(expected_depth),
         "-c",
         "1",
         "-exit-on-inactivity",

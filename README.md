@@ -59,6 +59,8 @@ Progress output stays concise:
 - cached-enrichment updates show reuse without refetching a website
 - export updates print the final CSV, JSON, and Excel paths
 
+Google Maps acquisition scales Docker `-depth` from your requested limit at roughly 20 results per depth page, so larger limits can scroll past the first provider page instead of stopping around 20 rows.
+
 ## Campaign Workflow
 
 Campaigns isolate one normalized business type, keep deduplication and quota global, and write one master CSV/JSON/Excel export set per campaign under `exports/campaigns/<slug>/`.
