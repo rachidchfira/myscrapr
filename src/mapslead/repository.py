@@ -15,6 +15,7 @@ from mapslead.errors import (
     InvalidCampaignError,
     QuotaExceededError,
 )
+from mapslead.input_validation import validate_language_code, validate_search_query
 from mapslead.models import (
     Acceptance,
     CampaignRecord,
@@ -35,7 +36,7 @@ from mapslead.normalize import (
     validate_campaign_slug,
 )
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 _SCHEMA = """
 CREATE TABLE schema_version(version INTEGER NOT NULL);
 CREATE TABLE businesses(
@@ -53,6 +54,8 @@ CREATE TABLE runs(
     id TEXT PRIMARY KEY,
     business_type TEXT NOT NULL,
     location_query TEXT NOT NULL,
+    search_query TEXT NOT NULL,
+    language TEXT NOT NULL,
     requested_limit INTEGER NOT NULL,
     status TEXT NOT NULL,
     started_at TEXT NOT NULL,
@@ -153,55 +156,14 @@ class SQLiteRepository:
             version = int(_require_row(row, "schema_version")[0])
             if version == _SCHEMA_VERSION:
                 return
-            if version != 1:
+            if version not in {1, 2}:
                 raise RuntimeError(f"unsupported schema version: {version}")
 
             connection.execute("BEGIN IMMEDIATE")
             try:
-                connection.execute(
-                    "ALTER TABLE runs ADD COLUMN refresh_enrichment INTEGER NOT NULL DEFAULT 0"
-                )
-                connection.execute(
-                    """
-                    CREATE TABLE campaigns(
-                        slug TEXT PRIMARY KEY,
-                        business_type TEXT NOT NULL,
-                        normalized_business_type TEXT NOT NULL,
-                        created_at TEXT NOT NULL
-                    )
-                    """
-                )
-                connection.execute(
-                    """
-                    CREATE TABLE campaign_runs(
-                        campaign_slug TEXT NOT NULL REFERENCES campaigns(slug),
-                        run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
-                        attached_at TEXT NOT NULL,
-                        PRIMARY KEY(campaign_slug, run_id)
-                    )
-                    """
-                )
-                connection.execute(
-                    """
-                    CREATE TABLE campaign_businesses(
-                        campaign_slug TEXT NOT NULL REFERENCES campaigns(slug),
-                        business_id INTEGER NOT NULL REFERENCES businesses(id),
-                        first_discovered_at TEXT NOT NULL,
-                        last_discovered_at TEXT NOT NULL,
-                        PRIMARY KEY(campaign_slug, business_id)
-                    )
-                    """
-                )
-                connection.execute(
-                    """
-                    CREATE TABLE business_enrichment_cache(
-                        business_id INTEGER PRIMARY KEY REFERENCES businesses(id),
-                        normalized_website TEXT NOT NULL,
-                        result_json TEXT NOT NULL,
-                        completed_at TEXT NOT NULL
-                    )
-                    """
-                )
+                if version == 1:
+                    self._migrate_v1_to_v2(connection)
+                self._migrate_v2_to_v3(connection)
                 connection.execute("UPDATE schema_version SET version = ?", (_SCHEMA_VERSION,))
                 connection.commit()
             except Exception:
@@ -217,12 +179,16 @@ class SQLiteRepository:
         now: datetime,
         *,
         campaign_slug: str | None = None,
+        query: str | None = None,
+        language: str = "en",
         refresh_enrichment: bool = False,
     ) -> RunRecord:
         run_id = uuid4().hex
         provider_dir = self._settings.data_dir / "runs" / run_id / "provider"
         provider_dir.mkdir(parents=True, exist_ok=True)
         validated_campaign_slug = None if campaign_slug is None else validate_campaign_slug(campaign_slug)
+        validated_query = validate_search_query(business if query is None else query)
+        validated_language = validate_language_code(language)
 
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -241,6 +207,8 @@ class SQLiteRepository:
                         id,
                         business_type,
                         location_query,
+                        search_query,
+                        language,
                         requested_limit,
                         status,
                         started_at,
@@ -249,12 +217,14 @@ class SQLiteRepository:
                         error,
                         new_unique_count,
                         refresh_enrichment
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         run_id,
                         business,
                         location,
+                        validated_query,
+                        validated_language,
                         requested_limit,
                         RunStatus.RUNNING.value,
                         now.isoformat(),
@@ -803,6 +773,8 @@ class SQLiteRepository:
             id=str(row["id"]),
             business_type=str(row["business_type"]),
             location_query=str(row["location_query"]),
+            search_query=str(row["search_query"]),
+            language=str(row["language"]),
             requested_limit=int(row["requested_limit"]),
             status=RunStatus(str(row["status"])),
             started_at=_parse_datetime(str(row["started_at"])),
@@ -814,6 +786,68 @@ class SQLiteRepository:
             new_unique_count=int(row["new_unique_count"]),
             campaign_slug=campaign_slug,
             refresh_enrichment=refresh_enrichment,
+        )
+
+    def _migrate_v1_to_v2(self, connection: sqlite3.Connection) -> None:
+        connection.execute("ALTER TABLE runs ADD COLUMN refresh_enrichment INTEGER NOT NULL DEFAULT 0")
+        connection.execute(
+            """
+            CREATE TABLE campaigns(
+                slug TEXT PRIMARY KEY,
+                business_type TEXT NOT NULL,
+                normalized_business_type TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE campaign_runs(
+                campaign_slug TEXT NOT NULL REFERENCES campaigns(slug),
+                run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
+                attached_at TEXT NOT NULL,
+                PRIMARY KEY(campaign_slug, run_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE campaign_businesses(
+                campaign_slug TEXT NOT NULL REFERENCES campaigns(slug),
+                business_id INTEGER NOT NULL REFERENCES businesses(id),
+                first_discovered_at TEXT NOT NULL,
+                last_discovered_at TEXT NOT NULL,
+                PRIMARY KEY(campaign_slug, business_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE business_enrichment_cache(
+                business_id INTEGER PRIMARY KEY REFERENCES businesses(id),
+                normalized_website TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                completed_at TEXT NOT NULL
+            )
+            """
+        )
+
+    def _migrate_v2_to_v3(self, connection: sqlite3.Connection) -> None:
+        connection.execute("ALTER TABLE runs ADD COLUMN search_query TEXT NOT NULL DEFAULT ''")
+        connection.execute("ALTER TABLE runs ADD COLUMN language TEXT NOT NULL DEFAULT 'en'")
+        connection.execute(
+            """
+            UPDATE runs
+            SET search_query = business_type
+            WHERE search_query = ''
+            """
+        )
+        connection.execute(
+            """
+            UPDATE runs
+            SET language = 'en'
+            WHERE language = ''
+            """
         )
 
     def _quota_day(self, now: datetime) -> str:

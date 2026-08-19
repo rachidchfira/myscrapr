@@ -74,6 +74,8 @@ class RepositoryPort(Protocol):
         now: datetime,
         *,
         campaign_slug: str | None = None,
+        query: str | None = None,
+        language: str = "en",
         refresh_enrichment: bool = False,
     ) -> RunRecord: ...
 

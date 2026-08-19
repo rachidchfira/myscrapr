@@ -88,6 +88,8 @@ def test_acquire_runs_docker_with_expected_args_and_query_file(
         location="Ho Chi Minh City",
         provider_dir=tmp_path / "provider",
         max_new_records=requested_limit,
+        search_query="phòng khám nha khoa",
+        language="vi",
     )
     runner = FakeRunner(writer=copy_fixture(fixture_results_csv))
     provider = GosomDockerProvider(process_runner=runner)
@@ -117,6 +119,8 @@ def test_acquire_runs_docker_with_expected_args_and_query_file(
         "/queries.txt",
         "-results",
         "/out/results.csv",
+        "-lang",
+        "vi",
         "-depth",
         str(expected_depth),
         "-c",
@@ -124,7 +128,9 @@ def test_acquire_runs_docker_with_expected_args_and_query_file(
         "-exit-on-inactivity",
         "3m",
     ]
-    assert (attempt_dir / "queries.txt").read_text(encoding="utf-8") == "dentists in Ho Chi Minh City\n"
+    assert (
+        attempt_dir / "queries.txt"
+    ).read_text(encoding="utf-8") == "phòng khám nha khoa in Ho Chi Minh City\n"
 
 
 def test_aliases_map_to_internal_model_and_malformed_rows_are_rejected(

@@ -195,16 +195,21 @@ def test_v1_database_migrates_without_losing_existing_run(
 
     assert run.status is RunStatus.COMPLETED
     assert run.refresh_enrichment is False
+    assert run.search_query == "dentists"
+    assert run.language == "en"
     assert len(snapshots) == 1
     assert snapshots[0].emails == ("hello@legacy.example.com",)
     assert v1_repository.remaining_quota(now) == DAILY_NEW_RECORD_LIMIT - 1
 
     with sqlite3.connect(settings.data_dir / "mapslead.sqlite3") as connection:
         version = connection.execute("SELECT version FROM schema_version").fetchone()
-        refresh = connection.execute("SELECT refresh_enrichment FROM runs WHERE id = ?", (existing_run_id,)).fetchone()
+        migrated = connection.execute(
+            "SELECT refresh_enrichment, search_query, language FROM runs WHERE id = ?",
+            (existing_run_id,),
+        ).fetchone()
 
-    assert version == (2,)
-    assert refresh == (0,)
+    assert version == (3,)
+    assert migrated == (0, "dentists", "en")
 
 
 def test_create_campaign_persists_and_gets_by_slug(
@@ -227,6 +232,28 @@ def test_create_campaign_rejects_duplicate_slug(
 
     with pytest.raises(InvalidCampaignError, match="already exists"):
         repository.create_campaign("vietnam-dentists", "dentists", now)
+
+
+def test_campaign_run_persists_alias_query_without_changing_business_type(
+    repository: SQLiteRepository,
+    now: datetime,
+) -> None:
+    campaign = repository.create_campaign("vietnam-dentists", "dentists", now)
+
+    run = repository.create_run(
+        "Dentists",
+        "Hà Nội",
+        10,
+        now,
+        campaign_slug=campaign.slug,
+        query="phòng khám nha khoa",
+        language="vi",
+    )
+
+    assert run.business_type == "Dentists"
+    assert run.search_query == "phòng khám nha khoa"
+    assert run.language == "vi"
+    assert repository.get_campaign(campaign.slug).business_type == "dentists"
 
 
 @pytest.mark.parametrize(

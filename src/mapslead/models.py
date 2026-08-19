@@ -3,9 +3,11 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from mapslead.input_validation import validate_language_code, validate_search_query
 
 
 class RunStatus(StrEnum):
@@ -48,6 +50,14 @@ class ProviderRequest(FrozenModel):
     location: str
     provider_dir: Path
     max_new_records: int = Field(ge=1)
+    search_query: str = ""
+    language: str = "en"
+
+    @model_validator(mode="after")
+    def _normalize_query_inputs(self) -> Self:
+        object.__setattr__(self, "search_query", validate_search_query(self.search_query or self.business))
+        object.__setattr__(self, "language", validate_language_code(self.language))
+        return self
 
 
 class ProviderResult(FrozenModel):
@@ -157,6 +167,8 @@ class RunRecord(FrozenModel):
     id: str
     business_type: str
     location_query: str
+    search_query: str = ""
+    language: str = "en"
     requested_limit: int = Field(ge=1)
     status: RunStatus
     started_at: datetime
@@ -166,6 +178,16 @@ class RunRecord(FrozenModel):
     new_unique_count: int = Field(default=0, ge=0)
     campaign_slug: str | None = None
     refresh_enrichment: bool = False
+
+    @model_validator(mode="after")
+    def _normalize_run_query_inputs(self) -> Self:
+        object.__setattr__(
+            self,
+            "search_query",
+            validate_search_query(self.search_query or self.business_type),
+        )
+        object.__setattr__(self, "language", validate_language_code(self.language))
+        return self
 
 
 class ExportPaths(FrozenModel):

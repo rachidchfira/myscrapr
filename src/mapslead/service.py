@@ -66,6 +66,8 @@ class MapsLeadService:
         progress: ProgressSink,
         *,
         campaign_slug: str | None = None,
+        query: str | None = None,
+        language: str = "en",
         refresh_enrichment: bool = False,
     ) -> RunOutcome:
         remaining_quota = self._repository.remaining_quota(now)
@@ -77,6 +79,8 @@ class MapsLeadService:
             limit,
             now,
             campaign_slug=campaign_slug,
+            query=query,
+            language=language,
             refresh_enrichment=refresh_enrichment,
         )
         acquisition_state = self._acquisition_state_for_run(run.id)
@@ -85,6 +89,8 @@ class MapsLeadService:
             location=location,
             provider_dir=run.provider_dir,
             max_new_records=limit,
+            search_query=run.search_query,
+            language=run.language,
         )
         provider_result = self._provider.acquire(
             request,
@@ -111,6 +117,8 @@ class MapsLeadService:
             location=run.location_query,
             provider_dir=run.provider_dir,
             max_new_records=run.requested_limit,
+            search_query=run.search_query,
+            language=run.language,
         )
         provider_result = self._provider.replay(
             replay_request,
@@ -134,6 +142,8 @@ class MapsLeadService:
                 location=run.location_query,
                 provider_dir=run.provider_dir,
                 max_new_records=acquire_capacity,
+                search_query=run.search_query,
+                language=run.language,
             )
             provider_result = self._provider.acquire(
                 acquire_request,

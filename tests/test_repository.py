@@ -407,6 +407,50 @@ def test_set_run_status_updates_finished_at_and_error(
     assert repository.get_run(run.id) == updated
 
 
+def test_create_run_persists_query_and_language(
+    repository: SQLiteRepository,
+    now: datetime,
+) -> None:
+    run = repository.create_run(
+        "dentists",
+        "Hanoi",
+        10,
+        now,
+        query="phòng khám nha khoa",
+        language="VI",
+    )
+
+    assert run.business_type == "dentists"
+    assert run.search_query == "phòng khám nha khoa"
+    assert run.language == "vi"
+
+    with sqlite3.connect(repository._settings.data_dir / "mapslead.sqlite3") as connection:
+        row = connection.execute(
+            "SELECT search_query, language FROM runs WHERE id = ?",
+            (run.id,),
+        ).fetchone()
+
+    assert row == ("phòng khám nha khoa", "vi")
+
+
+@pytest.mark.parametrize(
+    ("query", "language", "error_pattern"),
+    [
+        (" \n ", "en", "search query"),
+        ("dentists", "english us", "language"),
+    ],
+)
+def test_create_run_rejects_invalid_query_or_language(
+    repository: SQLiteRepository,
+    now: datetime,
+    query: str,
+    language: str,
+    error_pattern: str,
+) -> None:
+    with pytest.raises(ValueError, match=error_pattern):
+        repository.create_run("dentists", "Hanoi", 10, now, query=query, language=language)
+
+
 def test_two_connections_race_for_final_quota_slot(
     settings: Settings,
     now: datetime,
@@ -468,7 +512,7 @@ def repository_remaining(settings: Settings, now: datetime) -> int:
     return reopened.remaining_quota(now)
 
 
-def test_initialize_creates_schema_version_two_with_campaign_tables(settings: Settings) -> None:
+def test_initialize_creates_schema_version_three_with_campaign_tables(settings: Settings) -> None:
     repository = SQLiteRepository(settings)
     repository.initialize()
 
@@ -495,7 +539,7 @@ def test_initialize_creates_schema_version_two_with_campaign_tables(settings: Se
             for row in connection.execute("PRAGMA table_info(runs)").fetchall()
         }
 
-    assert version == (2,)
+    assert version == (3,)
     assert campaign_tables == {
         "business_enrichment_cache",
         "campaign_businesses",
@@ -503,3 +547,129 @@ def test_initialize_creates_schema_version_two_with_campaign_tables(settings: Se
         "campaigns",
     }
     assert runs_columns["refresh_enrichment"] == "INTEGER"
+    assert runs_columns["search_query"] == "TEXT"
+    assert runs_columns["language"] == "TEXT"
+
+
+def test_v2_database_migrates_query_and_language_columns_with_backfill(
+    settings: Settings,
+) -> None:
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    database_path = settings.data_dir / "mapslead.sqlite3"
+    provider_dir = settings.data_dir / "runs" / "legacy-v2" / "provider"
+    provider_dir.mkdir(parents=True, exist_ok=True)
+
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE schema_version(version INTEGER NOT NULL);
+            CREATE TABLE businesses(
+                id INTEGER PRIMARY KEY,
+                place_id TEXT UNIQUE,
+                canonical_json TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL
+            );
+            CREATE TABLE identity_aliases(
+                alias TEXT PRIMARY KEY,
+                business_id INTEGER NOT NULL REFERENCES businesses(id)
+            );
+            CREATE TABLE runs(
+                id TEXT PRIMARY KEY,
+                business_type TEXT NOT NULL,
+                location_query TEXT NOT NULL,
+                requested_limit INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                provider_dir TEXT NOT NULL,
+                error TEXT,
+                new_unique_count INTEGER NOT NULL DEFAULT 0 CHECK(new_unique_count >= 0),
+                refresh_enrichment INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE run_businesses(
+                run_id TEXT NOT NULL REFERENCES runs(id),
+                business_id INTEGER NOT NULL REFERENCES businesses(id),
+                snapshot_json TEXT NOT NULL,
+                enrichment_status TEXT NOT NULL,
+                enrichment_error TEXT,
+                PRIMARY KEY(run_id, business_id)
+            );
+            CREATE TABLE daily_quota(
+                day TEXT PRIMARY KEY,
+                accepted_count INTEGER NOT NULL CHECK(accepted_count BETWEEN 0 AND 1000)
+            );
+            CREATE TABLE campaigns(
+                slug TEXT PRIMARY KEY,
+                business_type TEXT NOT NULL,
+                normalized_business_type TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE campaign_runs(
+                campaign_slug TEXT NOT NULL REFERENCES campaigns(slug),
+                run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
+                attached_at TEXT NOT NULL,
+                PRIMARY KEY(campaign_slug, run_id)
+            );
+            CREATE TABLE campaign_businesses(
+                campaign_slug TEXT NOT NULL REFERENCES campaigns(slug),
+                business_id INTEGER NOT NULL REFERENCES businesses(id),
+                first_discovered_at TEXT NOT NULL,
+                last_discovered_at TEXT NOT NULL,
+                PRIMARY KEY(campaign_slug, business_id)
+            );
+            CREATE TABLE business_enrichment_cache(
+                business_id INTEGER PRIMARY KEY REFERENCES businesses(id),
+                normalized_website TEXT NOT NULL,
+                result_json TEXT NOT NULL,
+                completed_at TEXT NOT NULL
+            );
+            INSERT INTO schema_version(version) VALUES (2);
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO runs(
+                id,
+                business_type,
+                location_query,
+                requested_limit,
+                status,
+                started_at,
+                finished_at,
+                provider_dir,
+                error,
+                new_unique_count,
+                refresh_enrichment
+            ) VALUES (
+                'legacy-v2',
+                'dentists',
+                'Hanoi',
+                10,
+                'completed',
+                '2026-08-19T10:00:00+00:00',
+                '2026-08-19T10:05:00+00:00',
+                ?,
+                NULL,
+                0,
+                1
+            );
+            """,
+            (str(provider_dir),),
+        )
+
+    repository = SQLiteRepository(settings)
+    repository.initialize()
+    run = repository.get_run("legacy-v2")
+
+    assert run.search_query == "dentists"
+    assert run.language == "en"
+
+    with sqlite3.connect(database_path) as connection:
+        version = connection.execute("SELECT version FROM schema_version").fetchone()
+        row = connection.execute(
+            "SELECT search_query, language FROM runs WHERE id = 'legacy-v2'"
+        ).fetchone()
+
+    assert version == (3,)
+    assert row == ("dentists", "en")

@@ -200,6 +200,43 @@ def test_scrape_caps_new_unique_acceptance_at_default_limit_and_exports_results(
     assert exported[0]["run_id"] == outcome.run.id
 
 
+def test_scrape_uses_persisted_query_and_language_for_provider_requests(
+    repository: SQLiteRepository,
+    exporter: Exporter,
+    now: datetime,
+) -> None:
+    provider = FakeProvider(
+        acquire_scripts=[
+            ProviderScript(
+                result=ProviderResult(
+                    status="completed",
+                    candidate_count=0,
+                    rejected_row_count=0,
+                    diagnostics_tail="done",
+                ),
+            )
+        ]
+    )
+    service = MapsLeadService(repository, provider, FakeEnricher(), exporter)
+
+    outcome = service.scrape(
+        "dentists",
+        "Hà Nội",
+        5,
+        now,
+        _progress_sink([]),
+        query="phòng khám nha khoa",
+        language="VI",
+    )
+
+    assert_run_completed(outcome)
+    assert outcome.run.search_query == "phòng khám nha khoa"
+    assert outcome.run.language == "vi"
+    assert provider.acquire_requests[0].search_query == "phòng khám nha khoa"
+    assert provider.acquire_requests[0].language == "vi"
+    assert provider.acquire_requests[0].business == "dentists"
+
+
 def test_scrape_duplicate_candidates_do_not_consume_quota_twice_or_duplicate_export_rows(
     repository: SQLiteRepository,
     exporter: Exporter,
@@ -739,6 +776,53 @@ def test_resume_replays_durable_rows_enriches_pending_only_and_finishes_same_run
     snapshots = repository.snapshots_for_run(run.id)
     assert [snapshot.business_id for snapshot in snapshots] == [first.business_id, second.business_id, 3]
     assert repository.new_unique_count_for_run(run.id) == 3
+
+
+def test_resume_reuses_persisted_query_and_language_for_replay_and_acquire(
+    repository: SQLiteRepository,
+    exporter: Exporter,
+    now: datetime,
+) -> None:
+    provider = FakeProvider(
+        replay_scripts=[
+            ProviderScript(
+                result=ProviderResult(
+                    status="completed",
+                    candidate_count=0,
+                    rejected_row_count=0,
+                    diagnostics_tail="replayed",
+                ),
+            )
+        ],
+        acquire_scripts=[
+            ProviderScript(
+                result=ProviderResult(
+                    status="completed",
+                    candidate_count=0,
+                    rejected_row_count=0,
+                    diagnostics_tail="acquired",
+                ),
+            )
+        ],
+    )
+    service = MapsLeadService(repository, provider, FakeEnricher(), exporter)
+    run = repository.create_run(
+        "dentists",
+        "Hà Nội",
+        3,
+        now,
+        query="phòng khám nha khoa",
+        language="vi",
+    )
+    repository.set_run_status(run.id, RunStatus.PARTIAL, finished_at=now, error="interrupted")
+
+    outcome = service.resume(run.id, now, _progress_sink([]))
+
+    assert_run_completed(outcome)
+    assert provider.replay_requests[0].search_query == "phòng khám nha khoa"
+    assert provider.replay_requests[0].language == "vi"
+    assert provider.acquire_requests[0].search_query == "phòng khám nha khoa"
+    assert provider.acquire_requests[0].language == "vi"
 
 
 def test_resume_rejects_running_and_completed_runs_before_provider_calls(

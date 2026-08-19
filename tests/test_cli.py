@@ -186,9 +186,23 @@ class TrackingRepository(SQLiteRepository):
         location: str,
         requested_limit: int,
         now: datetime,
+        *,
+        campaign_slug: str | None = None,
+        query: str | None = None,
+        language: str = "en",
+        refresh_enrichment: bool = False,
     ) -> RunRecord:
         self.create_run_calls += 1
-        return super().create_run(business, location, requested_limit, now)
+        return super().create_run(
+            business,
+            location,
+            requested_limit,
+            now,
+            campaign_slug=campaign_slug,
+            query=query,
+            language=language,
+            refresh_enrichment=refresh_enrichment,
+        )
 
 
 @dataclass(frozen=True, slots=True)

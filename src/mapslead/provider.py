@@ -177,7 +177,7 @@ class GosomDockerProvider(MapsProvider):
         out_dir.mkdir(parents=True, exist_ok=False)
         queries_path = attempt_dir / "queries.txt"
         queries_path.write_text(
-            f"{request.business} in {request.location}\n",
+            f"{request.search_query} in {request.location}\n",
             encoding="utf-8",
         )
 
@@ -186,6 +186,7 @@ class GosomDockerProvider(MapsProvider):
                 queries_path,
                 out_dir,
                 max_new_records=request.max_new_records,
+                language=request.language,
             ),
             attempt_dir,
         )
@@ -264,7 +265,13 @@ def _docker_depth(max_new_records: int) -> int:
     return max(1, (max_new_records + RESULTS_PER_DEPTH - 1) // RESULTS_PER_DEPTH)
 
 
-def _docker_args(queries_path: Path, out_dir: Path, *, max_new_records: int) -> list[str]:
+def _docker_args(
+    queries_path: Path,
+    out_dir: Path,
+    *,
+    max_new_records: int,
+    language: str,
+) -> list[str]:
     return [
         "docker",
         "run",
@@ -278,6 +285,8 @@ def _docker_args(queries_path: Path, out_dir: Path, *, max_new_records: int) -> 
         "/queries.txt",
         "-results",
         "/out/results.csv",
+        "-lang",
+        language,
         "-depth",
         str(_docker_depth(max_new_records)),
         "-c",

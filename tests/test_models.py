@@ -1,10 +1,11 @@
+from datetime import UTC, datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pytest
 
 from mapslead.config import DAILY_NEW_RECORD_LIMIT, Settings
-from mapslead.models import ProviderCandidate
+from mapslead.models import ProviderCandidate, ProviderRequest, RunRecord, RunStatus
 from mapslead.normalize import build_identity, normalize_phone, normalize_text
 
 
@@ -62,3 +63,67 @@ def test_candidate_without_any_complete_identity_is_rejected() -> None:
 def test_normalizers_collapse_unicode_text_and_phone() -> None:
     assert normalize_text("  EXAMPLE\u00a0  Dental  ") == "example dental"
     assert normalize_phone(" +84 (28) 123-456 ") == "+8428123456"
+
+
+def test_provider_request_defaults_and_normalizes_query_language(tmp_path: Path) -> None:
+    request = ProviderRequest(
+        business="dentists",
+        location="Hanoi",
+        provider_dir=tmp_path / "provider",
+        max_new_records=5,
+        search_query="  phòng khám nha khoa  ",
+        language="VI",
+    )
+
+    assert request.search_query == "phòng khám nha khoa"
+    assert request.language == "vi"
+
+    defaulted = ProviderRequest(
+        business="dentists",
+        location="Hanoi",
+        provider_dir=tmp_path / "provider-default",
+        max_new_records=5,
+    )
+    assert defaulted.search_query == "dentists"
+    assert defaulted.language == "en"
+
+
+@pytest.mark.parametrize(
+    ("search_query", "language", "error_pattern"),
+    [
+        (" \n ", "en", "search query"),
+        ("dentists\tteam", "en", "search query"),
+        ("dentists", "english us", "language"),
+        ("dentists", "vi\nVN", "language"),
+    ],
+)
+def test_provider_request_rejects_invalid_query_or_language(
+    tmp_path: Path,
+    search_query: str,
+    language: str,
+    error_pattern: str,
+) -> None:
+    with pytest.raises(ValueError, match=error_pattern):
+        ProviderRequest(
+            business="dentists",
+            location="Hanoi",
+            provider_dir=tmp_path / "provider",
+            max_new_records=5,
+            search_query=search_query,
+            language=language,
+        )
+
+
+def test_run_record_defaults_search_query_and_language() -> None:
+    run = RunRecord(
+        id="run-1",
+        business_type="Dentists",
+        location_query="Hanoi",
+        requested_limit=5,
+        status=RunStatus.RUNNING,
+        started_at=datetime(2026, 8, 19, 10, 0, tzinfo=UTC),
+        provider_dir=Path("/tmp/provider"),
+    )
+
+    assert run.search_query == "Dentists"
+    assert run.language == "en"
