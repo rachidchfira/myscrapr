@@ -543,7 +543,7 @@ class SQLiteRepository:
                         connection=connection,
                         campaign_slug=run.campaign_slug,
                         business_id=business_id,
-                        first_discovered_at=snapshot.first_seen_at,
+                        first_discovered_at=now,
                         last_discovered_at=now,
                     )
                 connection.commit()

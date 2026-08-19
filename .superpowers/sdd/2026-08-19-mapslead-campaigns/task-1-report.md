@@ -52,3 +52,28 @@ Follow-up Checks:
 Resolved Concerns:
 - The stale schema-version assertion in `tests/test_repository.py` is corrected to the approved version-2 contract.
 - This report is now intended to be committed with the follow-up test correction.
+
+Review Fix Round 1:
+- Finding addressed: campaign membership timestamps for reused global businesses incorrectly inherited the global business first-seen timestamp on first campaign discovery.
+- Scope: `src/mapslead/repository.py`, `tests/test_campaign_repository.py`
+
+Review Fix Round 1 RED:
+- `.venv/bin/python -m pytest tests/test_campaign_repository.py -q -k membership_timestamps_start_at_first_campaign_discovery`
+- Result: `1 failed, 18 deselected`
+- Failure: `CampaignSnapshot.first_seen_at` was `2026-08-18T10:00:00+00:00` from the earlier non-campaign sighting instead of the first campaign discovery time `2026-08-19T10:00:00+00:00`
+
+Review Fix Round 1 GREEN:
+- `.venv/bin/python -m pytest tests/test_campaign_repository.py -q -k membership_timestamps_start_at_first_campaign_discovery`
+- Result: `1 passed, 18 deselected in 0.11s`
+
+Review Fix Round 1 Checks:
+- `.venv/bin/python -m pytest tests/test_campaign_repository.py tests/test_repository.py tests/test_models.py -q`
+- Result: `43 passed in 0.53s`
+- `.venv/bin/python -m ruff check src/mapslead/repository.py tests/test_campaign_repository.py`
+- Result: `All checks passed!`
+- `.venv/bin/python -m mypy src/mapslead`
+- Result: `Success: no issues found in 12 source files`
+
+Review Fix Round 1 Notes:
+- Candidate acceptance for campaign runs now seeds a new campaign membership from the campaign discovery time `now`; later sightings continue to advance `last_discovered_at`.
+- Existing `attach_run` behavior is unchanged and still seeds campaign membership timestamps from attached run snapshots.

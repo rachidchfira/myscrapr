@@ -376,6 +376,48 @@ def test_campaign_snapshots_use_latest_campaign_snapshot_and_canonical_enrichmen
     assert snapshots[0].enrichment_status is EnrichmentStatus.PENDING
 
 
+def test_campaign_membership_timestamps_start_at_first_campaign_discovery_for_reused_business(
+    repository: SQLiteRepository,
+) -> None:
+    global_seen_at = datetime(2026, 8, 18, 10, 0, tzinfo=UTC)
+    campaign_first_seen_at = datetime(2026, 8, 19, 10, 0, tzinfo=UTC)
+    campaign_last_seen_at = datetime(2026, 8, 20, 10, 0, tzinfo=UTC)
+    candidate = ProviderCandidate(
+        name="Example Dental",
+        place_id="ChIJ-123",
+        website="https://example.com",
+    )
+
+    global_run = repository.create_run("dentists", "HCMC", 10, global_seen_at)
+    repository.accept_candidate(global_run.id, candidate, global_seen_at)
+
+    campaign = repository.create_campaign("vietnam-dentists", "dentists", campaign_first_seen_at)
+    first_campaign_run = repository.create_run(
+        "dentists",
+        "Hanoi",
+        10,
+        campaign_first_seen_at,
+        campaign_slug=campaign.slug,
+    )
+    repository.accept_candidate(first_campaign_run.id, candidate, campaign_first_seen_at)
+
+    second_campaign_run = repository.create_run(
+        "dentists",
+        "Da Nang",
+        10,
+        campaign_last_seen_at,
+        campaign_slug=campaign.slug,
+    )
+    repository.accept_candidate(second_campaign_run.id, candidate, campaign_last_seen_at)
+
+    snapshots = repository.campaign_snapshots(campaign.slug)
+
+    assert len(snapshots) == 1
+    assert snapshots[0].first_seen_at == campaign_first_seen_at
+    assert snapshots[0].last_seen_at == campaign_last_seen_at
+    assert snapshots[0].discovered_in == ("Da Nang", "Hanoi")
+
+
 def test_campaign_status_counts_completed_failed_skipped_and_pending(
     repository: SQLiteRepository,
     now: datetime,
