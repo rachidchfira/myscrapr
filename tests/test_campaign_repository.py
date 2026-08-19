@@ -14,12 +14,14 @@ from mapslead.errors import (
     InvalidCampaignError,
 )
 from mapslead.models import (
+    EnrichmentCacheEntry,
     EnrichmentResult,
     EnrichmentStatus,
     ProviderCandidate,
     RunSnapshot,
     RunStatus,
 )
+from mapslead.normalize import normalize_website_url
 from mapslead.repository import SQLiteRepository
 
 
@@ -227,6 +229,116 @@ def test_create_campaign_rejects_duplicate_slug(
         repository.create_campaign("vietnam-dentists", "dentists", now)
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("HTTPS://Example.COM:443/#team", "https://example.com/"),
+        ("http://Example.COM:80", "http://example.com/"),
+        ("https://example.com/contact?lang=en", "https://example.com/contact?lang=en"),
+        ("mailto:test@example.com", None),
+        (None, None),
+    ],
+)
+def test_normalize_website_url_handles_equivalent_http_urls(
+    value: str | None,
+    expected: str | None,
+) -> None:
+    assert normalize_website_url(value) == expected
+
+
+def test_cached_enrichment_matches_only_same_normalized_website(
+    repository: SQLiteRepository,
+    candidate: ProviderCandidate,
+    now: datetime,
+) -> None:
+    run = repository.create_run("dentists", "Hanoi", 10, now)
+    acceptance = repository.accept_candidate(run.id, candidate, now)
+    result = EnrichmentResult(
+        status=EnrichmentStatus.COMPLETED,
+        emails=("cached@example.com",),
+    )
+
+    repository.save_cached_enrichment(
+        acceptance.business_id,
+        "HTTPS://Example.COM:443/#team",
+        result,
+        now,
+    )
+
+    cached = repository.cached_enrichment(
+        acceptance.business_id,
+        "https://example.com/",
+    )
+
+    assert cached == EnrichmentCacheEntry(
+        business_id=acceptance.business_id,
+        normalized_website="https://example.com/",
+        result=result,
+        completed_at=now,
+    )
+    assert (
+        repository.cached_enrichment(
+            acceptance.business_id,
+            "https://example.com/contact?lang=en",
+        )
+        is None
+    )
+    assert repository.cached_enrichment(acceptance.business_id, "mailto:test@example.com") is None
+
+
+def test_save_cached_enrichment_rejects_non_completed_results(
+    repository: SQLiteRepository,
+    candidate: ProviderCandidate,
+    now: datetime,
+) -> None:
+    run = repository.create_run("dentists", "Hanoi", 10, now)
+    acceptance = repository.accept_candidate(run.id, candidate, now)
+
+    with pytest.raises(ValueError, match="completed"):
+        repository.save_cached_enrichment(
+            acceptance.business_id,
+            candidate.website or "",
+            EnrichmentResult(
+                status=EnrichmentStatus.FAILED,
+                error="timeout",
+            ),
+            now,
+        )
+
+
+def test_failed_cache_write_does_not_replace_successful_cache(
+    repository: SQLiteRepository,
+    candidate: ProviderCandidate,
+    now: datetime,
+) -> None:
+    run = repository.create_run("dentists", "Hanoi", 10, now)
+    acceptance = repository.accept_candidate(run.id, candidate, now)
+    repository.save_cached_enrichment(
+        acceptance.business_id,
+        candidate.website or "",
+        EnrichmentResult(
+            status=EnrichmentStatus.COMPLETED,
+            emails=("kept@example.com",),
+        ),
+        now,
+    )
+
+    with pytest.raises(ValueError):
+        repository.save_cached_enrichment(
+            acceptance.business_id,
+            candidate.website or "",
+            EnrichmentResult(
+                status=EnrichmentStatus.FAILED,
+                error="later failure",
+            ),
+            now,
+        )
+
+    cached = repository.cached_enrichment(acceptance.business_id, candidate.website)
+    assert cached is not None
+    assert cached.result.emails == ("kept@example.com",)
+
+
 def test_attach_run_is_idempotent_for_same_campaign_and_preserves_quota(
     repository: SQLiteRepository,
     candidate: ProviderCandidate,
@@ -248,6 +360,32 @@ def test_attach_run_is_idempotent_for_same_campaign_and_preserves_quota(
     assert status.business_count == 1
     assert status.discovered_in == ("Hanoi",)
     assert repository.remaining_quota(now) == remaining_before_attach
+
+
+def test_attach_run_seeds_cache_from_completed_snapshot_matching_canonical_website(
+    repository: SQLiteRepository,
+    candidate: ProviderCandidate,
+    now: datetime,
+) -> None:
+    run = repository.create_run("dentists", "Hanoi", 10, now)
+    acceptance = repository.accept_candidate(run.id, candidate, now)
+    repository.save_enrichment(
+        run.id,
+        acceptance.business_id,
+        EnrichmentResult(
+            status=EnrichmentStatus.COMPLETED,
+            emails=("attached@example.com",),
+        ),
+        now,
+    )
+    repository.set_run_status(run.id, RunStatus.COMPLETED, finished_at=now)
+    campaign = repository.create_campaign("vietnam-dentists", "dentists", now)
+
+    repository.attach_run(campaign.slug, run.id, now)
+
+    cached = repository.cached_enrichment(acceptance.business_id, candidate.website)
+    assert cached is not None
+    assert cached.result.emails == ("attached@example.com",)
 
 
 def test_attach_run_rejects_missing_run(

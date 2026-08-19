@@ -20,6 +20,7 @@ from mapslead.models import (
     CampaignRecord,
     CampaignSnapshot,
     CampaignStatus,
+    EnrichmentCacheEntry,
     EnrichmentResult,
     EnrichmentStatus,
     ProviderCandidate,
@@ -27,7 +28,12 @@ from mapslead.models import (
     RunSnapshot,
     RunStatus,
 )
-from mapslead.normalize import build_identity, normalize_text, validate_campaign_slug
+from mapslead.normalize import (
+    build_identity,
+    normalize_text,
+    normalize_website_url,
+    validate_campaign_slug,
+)
 
 _SCHEMA_VERSION = 2
 _SCHEMA = """
@@ -332,8 +338,9 @@ class SQLiteRepository:
 
                 membership_rows = connection.execute(
                     """
-                    SELECT snapshot_json
+                    SELECT run_businesses.snapshot_json, businesses.canonical_json
                     FROM run_businesses
+                    INNER JOIN businesses ON businesses.id = run_businesses.business_id
                     WHERE run_id = ?
                     ORDER BY business_id
                     """,
@@ -347,6 +354,12 @@ class SQLiteRepository:
                         business_id=snapshot.business_id,
                         first_discovered_at=snapshot.first_seen_at,
                         last_discovered_at=snapshot.last_seen_at,
+                    )
+                    self._seed_cache_from_snapshot(
+                        connection=connection,
+                        business_id=snapshot.business_id,
+                        canonical_json=str(membership_row["canonical_json"]),
+                        snapshot=snapshot,
                     )
                 connection.commit()
             except Exception:
@@ -450,6 +463,17 @@ class SQLiteRepository:
             ]
             latest_snapshot = max(run_snapshots, key=lambda snapshot: (snapshot.last_seen_at, snapshot.run_id))
             discovered_in = tuple(sorted({snapshot.location_query for snapshot in run_snapshots}))
+            cached = self.cached_enrichment(business_id, canonical.website)
+            enrichment = cached.result if cached is not None else EnrichmentResult(
+                emails=latest_snapshot.emails,
+                facebook_url=latest_snapshot.facebook_url,
+                instagram_url=latest_snapshot.instagram_url,
+                linkedin_url=latest_snapshot.linkedin_url,
+                x_url=latest_snapshot.x_url,
+                youtube_url=latest_snapshot.youtube_url,
+                status=latest_snapshot.enrichment_status,
+                error=latest_snapshot.enrichment_error,
+            )
             snapshots.append(
                 CampaignSnapshot(
                     business_id=business_id,
@@ -467,14 +491,14 @@ class SQLiteRepository:
                     rating=canonical.rating,
                     review_count=canonical.review_count,
                     google_maps_url=canonical.google_maps_url,
-                    emails=latest_snapshot.emails,
-                    facebook_url=latest_snapshot.facebook_url,
-                    instagram_url=latest_snapshot.instagram_url,
-                    linkedin_url=latest_snapshot.linkedin_url,
-                    x_url=latest_snapshot.x_url,
-                    youtube_url=latest_snapshot.youtube_url,
-                    enrichment_status=latest_snapshot.enrichment_status,
-                    enrichment_error=latest_snapshot.enrichment_error,
+                    emails=enrichment.emails,
+                    facebook_url=enrichment.facebook_url,
+                    instagram_url=enrichment.instagram_url,
+                    linkedin_url=enrichment.linkedin_url,
+                    x_url=enrichment.x_url,
+                    youtube_url=enrichment.youtube_url,
+                    enrichment_status=enrichment.status,
+                    enrichment_error=enrichment.error,
                 )
             )
 
@@ -576,6 +600,33 @@ class SQLiteRepository:
         snapshots = tuple(self._snapshot_for_pending_enrichment(row) for row in rows)
         return tuple(snapshot for snapshot in snapshots if _has_http_website(snapshot.website))
 
+    def cached_enrichment(
+        self,
+        business_id: int,
+        website: str | None,
+    ) -> EnrichmentCacheEntry | None:
+        normalized_website = normalize_website_url(website)
+        if normalized_website is None:
+            return None
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT normalized_website, result_json, completed_at
+                FROM business_enrichment_cache
+                WHERE business_id = ? AND normalized_website = ?
+                """,
+                (business_id, normalized_website),
+            ).fetchone()
+        if row is None:
+            return None
+        return EnrichmentCacheEntry(
+            business_id=business_id,
+            normalized_website=str(row["normalized_website"]),
+            result=EnrichmentResult.model_validate_json(str(row["result_json"])),
+            completed_at=_parse_datetime(str(row["completed_at"])),
+        )
+
     def save_enrichment(
         self,
         run_id: str,
@@ -625,31 +676,67 @@ class SQLiteRepository:
                     ),
                 )
 
-                business_row = self._get_business_row(connection, business_id)
-                canonical = _CanonicalBusiness.model_validate_json(str(business_row["canonical_json"]))
-                updated_canonical = canonical.model_copy(
-                    update={
-                        "emails": result.emails,
-                        "facebook_url": result.facebook_url,
-                        "instagram_url": result.instagram_url,
-                        "linkedin_url": result.linkedin_url,
-                        "x_url": result.x_url,
-                        "youtube_url": result.youtube_url,
-                    }
-                )
-                connection.execute(
-                    """
-                    UPDATE businesses
-                    SET canonical_json = ?
-                    WHERE id = ?
-                    """,
-                    (updated_canonical.model_dump_json(), business_id),
-                )
+                if result.status is EnrichmentStatus.COMPLETED:
+                    business_row = self._get_business_row(connection, business_id)
+                    canonical = _CanonicalBusiness.model_validate_json(str(business_row["canonical_json"]))
+                    updated_canonical = canonical.model_copy(
+                        update={
+                            "emails": result.emails,
+                            "facebook_url": result.facebook_url,
+                            "instagram_url": result.instagram_url,
+                            "linkedin_url": result.linkedin_url,
+                            "x_url": result.x_url,
+                            "youtube_url": result.youtube_url,
+                        }
+                    )
+                    connection.execute(
+                        """
+                        UPDATE businesses
+                        SET canonical_json = ?
+                        WHERE id = ?
+                        """,
+                        (updated_canonical.model_dump_json(), business_id),
+                    )
                 connection.commit()
             except Exception:
                 if connection.in_transaction:
                     connection.rollback()
                 raise
+
+    def save_cached_enrichment(
+        self,
+        business_id: int,
+        website: str,
+        result: EnrichmentResult,
+        now: datetime,
+    ) -> None:
+        if result.status is not EnrichmentStatus.COMPLETED:
+            raise ValueError("cached enrichment requires completed results")
+        normalized_website = normalize_website_url(website)
+        if normalized_website is None:
+            raise ValueError("cached enrichment requires an HTTP(S) website")
+
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO business_enrichment_cache(
+                    business_id,
+                    normalized_website,
+                    result_json,
+                    completed_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(business_id) DO UPDATE SET
+                    normalized_website = excluded.normalized_website,
+                    result_json = excluded.result_json,
+                    completed_at = excluded.completed_at
+                """,
+                (
+                    business_id,
+                    normalized_website,
+                    result.model_dump_json(),
+                    now.isoformat(),
+                ),
+            )
 
     def set_run_status(
         self,
@@ -997,6 +1084,53 @@ class SQLiteRepository:
 
         return snapshot.model_copy(update={"website": canonical.website})
 
+    def _seed_cache_from_snapshot(
+        self,
+        *,
+        connection: sqlite3.Connection,
+        business_id: int,
+        canonical_json: str,
+        snapshot: RunSnapshot,
+    ) -> None:
+        if snapshot.enrichment_status is not EnrichmentStatus.COMPLETED:
+            return
+        canonical = _CanonicalBusiness.model_validate_json(canonical_json)
+        normalized_canonical_website = normalize_website_url(canonical.website)
+        normalized_snapshot_website = normalize_website_url(snapshot.website)
+        if normalized_canonical_website is None or normalized_snapshot_website != normalized_canonical_website:
+            return
+
+        result = EnrichmentResult(
+            status=snapshot.enrichment_status,
+            emails=snapshot.emails,
+            facebook_url=snapshot.facebook_url,
+            instagram_url=snapshot.instagram_url,
+            linkedin_url=snapshot.linkedin_url,
+            x_url=snapshot.x_url,
+            youtube_url=snapshot.youtube_url,
+            error=snapshot.enrichment_error,
+        )
+        connection.execute(
+            """
+            INSERT INTO business_enrichment_cache(
+                business_id,
+                normalized_website,
+                result_json,
+                completed_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(business_id) DO UPDATE SET
+                normalized_website = excluded.normalized_website,
+                result_json = excluded.result_json,
+                completed_at = excluded.completed_at
+            """,
+            (
+                business_id,
+                normalized_canonical_website,
+                result.model_dump_json(),
+                snapshot.last_seen_at.isoformat(),
+            ),
+        )
+
 
 def _campaign_snapshot_sort_key(snapshot: CampaignSnapshot) -> tuple[str, str, int]:
     return (
@@ -1007,10 +1141,7 @@ def _campaign_snapshot_sort_key(snapshot: CampaignSnapshot) -> tuple[str, str, i
 
 
 def _has_http_website(value: str | None) -> bool:
-    if value is None:
-        return False
-    lowered = value.casefold()
-    return lowered.startswith(("http://", "https://"))
+    return normalize_website_url(value) is not None
 
 
 def _parse_datetime(value: str) -> datetime:

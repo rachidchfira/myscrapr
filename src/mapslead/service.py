@@ -64,11 +64,21 @@ class MapsLeadService:
         limit: int,
         now: datetime,
         progress: ProgressSink,
+        *,
+        campaign_slug: str | None = None,
+        refresh_enrichment: bool = False,
     ) -> RunOutcome:
         remaining_quota = self._repository.remaining_quota(now)
         self._validate_requested_limit(limit, remaining_quota)
 
-        run = self._repository.create_run(business, location, limit, now)
+        run = self._repository.create_run(
+            business,
+            location,
+            limit,
+            now,
+            campaign_slug=campaign_slug,
+            refresh_enrichment=refresh_enrichment,
+        )
         acquisition_state = self._acquisition_state_for_run(run.id)
         request = ProviderRequest(
             business=business,
@@ -208,11 +218,30 @@ class MapsLeadService:
         )
 
     def _run_pending_enrichment(self, run_id: str, now: datetime, progress: ProgressSink) -> None:
+        run = self._repository.get_run(run_id)
         pending = tuple(self._repository.pending_enrichment(run_id))
         total = len(pending)
         for index, snapshot in enumerate(pending, start=1):
+            cached = None
+            if not run.refresh_enrichment:
+                cached = self._repository.cached_enrichment(snapshot.business_id, snapshot.website)
+            if cached is not None:
+                self._repository.save_enrichment(run_id, snapshot.business_id, cached.result, now)
+                progress(
+                    ProgressEvent(
+                        kind="enrichment_reused",
+                        message="Reused cached enrichment.",
+                        run_id=run_id,
+                        completed_count=index,
+                        total_count=total,
+                    )
+                )
+                continue
+
             result = self._enrich_snapshot(snapshot)
             self._repository.save_enrichment(run_id, snapshot.business_id, result, now)
+            if result.status is EnrichmentStatus.COMPLETED and snapshot.website is not None:
+                self._repository.save_cached_enrichment(snapshot.business_id, snapshot.website, result, now)
             progress(
                 ProgressEvent(
                     kind="enrichment",

@@ -283,6 +283,232 @@ def test_scrape_reuses_existing_business_and_enriches_current_run_without_checkp
     assert enricher.calls == ["https://reused.example.com"]
 
 
+def test_scrape_campaign_reuses_cached_enrichment_without_fetch(
+    repository: SQLiteRepository,
+    exporter: Exporter,
+    now: datetime,
+) -> None:
+    campaign = repository.create_campaign("vietnam-dentists", "dentists", now)
+    seed_candidate = candidate_for(1, website="https://cached.example.com")
+    seed_run = repository.create_run("dentists", "HCMC", 5, now)
+    seed_acceptance = repository.accept_candidate(seed_run.id, seed_candidate, now)
+    repository.save_cached_enrichment(
+        seed_acceptance.business_id,
+        "HTTPS://cached.example.com:443/#team",
+        EnrichmentResult(
+            status=EnrichmentStatus.COMPLETED,
+            emails=("cached@example.com",),
+        ),
+        now,
+    )
+    repository.set_run_status(seed_run.id, RunStatus.COMPLETED, finished_at=now)
+
+    provider = FakeProvider(
+        acquire_scripts=[
+            ProviderScript(
+                candidates=(seed_candidate,),
+                result=ProviderResult(
+                    status="completed",
+                    candidate_count=1,
+                    rejected_row_count=0,
+                    diagnostics_tail="done",
+                ),
+            )
+        ]
+    )
+    enricher = FakeEnricher()
+    service = MapsLeadService(repository, provider, enricher, exporter)
+    progress_events: list[ProgressEvent] = []
+
+    outcome = service.scrape(
+        "dentists",
+        "Hanoi",
+        5,
+        now,
+        _progress_sink(progress_events),
+        campaign_slug=campaign.slug,
+    )
+
+    assert_run_completed(outcome)
+    assert enricher.calls == []
+    snapshot = repository.snapshots_for_run(outcome.run.id)[0]
+    assert snapshot.emails == ("cached@example.com",)
+    assert [event.kind for event in progress_events] == ["acquisition", "enrichment_reused", "export"]
+
+
+def test_scrape_changed_website_invalidates_cache_and_updates_it(
+    repository: SQLiteRepository,
+    exporter: Exporter,
+    now: datetime,
+) -> None:
+    seed_candidate = candidate_for(1, website="https://old.example.com")
+    seed_run = repository.create_run("dentists", "HCMC", 5, now)
+    seed_acceptance = repository.accept_candidate(seed_run.id, seed_candidate, now)
+    repository.save_cached_enrichment(
+        seed_acceptance.business_id,
+        seed_candidate.website or "",
+        EnrichmentResult(
+            status=EnrichmentStatus.COMPLETED,
+            emails=("old@example.com",),
+        ),
+        now,
+    )
+    repository.set_run_status(seed_run.id, RunStatus.COMPLETED, finished_at=now)
+
+    updated_candidate = candidate_for(1, website="https://new.example.com")
+    provider = FakeProvider(
+        acquire_scripts=[
+            ProviderScript(
+                candidates=(updated_candidate,),
+                result=ProviderResult(
+                    status="completed",
+                    candidate_count=1,
+                    rejected_row_count=0,
+                    diagnostics_tail="done",
+                ),
+            )
+        ]
+    )
+    enricher = FakeEnricher(
+        responses={
+            "https://new.example.com": EnrichmentResult(
+                status=EnrichmentStatus.COMPLETED,
+                emails=("new@example.com",),
+            )
+        }
+    )
+    service = MapsLeadService(repository, provider, enricher, exporter)
+
+    outcome = service.scrape("dentists", "Hanoi", 5, now, _progress_sink([]))
+
+    assert_run_completed(outcome)
+    assert enricher.calls == ["https://new.example.com"]
+    snapshot = repository.snapshots_for_run(outcome.run.id)[0]
+    assert snapshot.website == "https://new.example.com"
+    assert snapshot.emails == ("new@example.com",)
+    assert repository.cached_enrichment(seed_acceptance.business_id, "https://old.example.com") is None
+    cached = repository.cached_enrichment(seed_acceptance.business_id, "https://new.example.com")
+    assert cached is not None
+    assert cached.result.emails == ("new@example.com",)
+
+
+def test_scrape_refresh_enrichment_bypasses_matching_cache(
+    repository: SQLiteRepository,
+    exporter: Exporter,
+    now: datetime,
+) -> None:
+    campaign = repository.create_campaign("vietnam-dentists", "dentists", now)
+    seed_candidate = candidate_for(1, website="https://refresh.example.com")
+    seed_run = repository.create_run("dentists", "HCMC", 5, now)
+    seed_acceptance = repository.accept_candidate(seed_run.id, seed_candidate, now)
+    repository.save_cached_enrichment(
+        seed_acceptance.business_id,
+        seed_candidate.website or "",
+        EnrichmentResult(
+            status=EnrichmentStatus.COMPLETED,
+            emails=("cached@example.com",),
+        ),
+        now,
+    )
+    repository.set_run_status(seed_run.id, RunStatus.COMPLETED, finished_at=now)
+
+    provider = FakeProvider(
+        acquire_scripts=[
+            ProviderScript(
+                candidates=(seed_candidate,),
+                result=ProviderResult(
+                    status="completed",
+                    candidate_count=1,
+                    rejected_row_count=0,
+                    diagnostics_tail="done",
+                ),
+            )
+        ]
+    )
+    enricher = FakeEnricher(
+        responses={
+            "https://refresh.example.com": EnrichmentResult(
+                status=EnrichmentStatus.COMPLETED,
+                emails=("refreshed@example.com",),
+            )
+        }
+    )
+    service = MapsLeadService(repository, provider, enricher, exporter)
+
+    outcome = service.scrape(
+        "dentists",
+        "Hanoi",
+        5,
+        now,
+        _progress_sink([]),
+        campaign_slug=campaign.slug,
+        refresh_enrichment=True,
+    )
+
+    assert_run_completed(outcome)
+    assert outcome.run.refresh_enrichment is True
+    assert enricher.calls == ["https://refresh.example.com"]
+    snapshot = repository.snapshots_for_run(outcome.run.id)[0]
+    assert snapshot.emails == ("refreshed@example.com",)
+
+
+def test_scrape_failed_enrichment_preserves_prior_successful_cache(
+    repository: SQLiteRepository,
+    exporter: Exporter,
+    now: datetime,
+) -> None:
+    seed_candidate = candidate_for(1, website="https://cache-failure.example.com")
+    seed_run = repository.create_run("dentists", "HCMC", 5, now)
+    seed_acceptance = repository.accept_candidate(seed_run.id, seed_candidate, now)
+    repository.save_cached_enrichment(
+        seed_acceptance.business_id,
+        seed_candidate.website or "",
+        EnrichmentResult(
+            status=EnrichmentStatus.COMPLETED,
+            emails=("cached@example.com",),
+        ),
+        now,
+    )
+    repository.set_run_status(seed_run.id, RunStatus.COMPLETED, finished_at=now)
+
+    provider = FakeProvider(
+        acquire_scripts=[
+            ProviderScript(
+                candidates=(seed_candidate,),
+                result=ProviderResult(
+                    status="completed",
+                    candidate_count=1,
+                    rejected_row_count=0,
+                    diagnostics_tail="done",
+                ),
+            )
+        ]
+    )
+    enricher = FakeEnricher(
+        responses={
+            "https://cache-failure.example.com": RuntimeError("timeout contacting website")
+        }
+    )
+    service = MapsLeadService(repository, provider, enricher, exporter)
+
+    outcome = service.scrape(
+        "dentists",
+        "Hanoi",
+        5,
+        now,
+        _progress_sink([]),
+        refresh_enrichment=True,
+    )
+
+    assert_run_completed(outcome)
+    snapshot = repository.snapshots_for_run(outcome.run.id)[0]
+    assert snapshot.enrichment_status is EnrichmentStatus.FAILED
+    assert snapshot.emails == ()
+    cached = repository.cached_enrichment(seed_acceptance.business_id, seed_candidate.website)
+    assert cached is not None
+    assert cached.result.emails == ("cached@example.com",)
+
+
 def test_scrape_quota_race_stops_new_uniques_but_finishes_and_exports_known_duplicates(
     repository: SQLiteRepository,
     exporter: Exporter,
@@ -634,6 +860,60 @@ def test_resume_at_requested_limit_replays_and_exports_without_new_acquisition(
     snapshot = repository.snapshots_for_run(run.id)[0]
     assert snapshot.business_id == acceptance.business_id
     assert snapshot.emails == ("resume@example.com",)
+
+
+def test_resume_uses_persisted_refresh_enrichment_flag(
+    repository: SQLiteRepository,
+    exporter: Exporter,
+    now: datetime,
+) -> None:
+    seed_candidate = candidate_for(1, website="https://resume-refresh.example.com")
+    seed_run = repository.create_run("dentists", "HCMC", 5, now)
+    seed_acceptance = repository.accept_candidate(seed_run.id, seed_candidate, now)
+    repository.save_cached_enrichment(
+        seed_acceptance.business_id,
+        seed_candidate.website or "",
+        EnrichmentResult(
+            status=EnrichmentStatus.COMPLETED,
+            emails=("cached@example.com",),
+        ),
+        now,
+    )
+    repository.set_run_status(seed_run.id, RunStatus.COMPLETED, finished_at=now)
+
+    run = repository.create_run("dentists", "HCMC", 1, now, refresh_enrichment=True)
+    repository.accept_candidate(run.id, seed_candidate, now)
+    repository.set_run_status(run.id, RunStatus.PARTIAL, finished_at=now, error="resume me")
+
+    provider = FakeProvider(
+        replay_scripts=[
+            ProviderScript(
+                candidates=(seed_candidate,),
+                result=ProviderResult(
+                    status="completed",
+                    candidate_count=1,
+                    rejected_row_count=0,
+                    diagnostics_tail="replayed",
+                ),
+            )
+        ]
+    )
+    enricher = FakeEnricher(
+        responses={
+            "https://resume-refresh.example.com": EnrichmentResult(
+                status=EnrichmentStatus.COMPLETED,
+                emails=("fresh@example.com",),
+            )
+        }
+    )
+    service = MapsLeadService(repository, provider, enricher, exporter)
+
+    outcome = service.resume(run.id, now, _progress_sink([]))
+
+    assert_run_completed(outcome)
+    assert enricher.calls == ["https://resume-refresh.example.com"]
+    snapshot = repository.snapshots_for_run(run.id)[0]
+    assert snapshot.emails == ("fresh@example.com",)
 
 
 @pytest.mark.parametrize(

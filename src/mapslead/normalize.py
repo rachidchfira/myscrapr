@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit, urlunsplit
 
 from tld import get_tld
 from tld.exceptions import TldBadUrl, TldDomainNotFound
@@ -36,6 +36,36 @@ def validate_campaign_slug(slug: str) -> str:
     if 1 <= len(slug) <= 64 and _CAMPAIGN_SLUG_RE.fullmatch(slug):
         return slug
     raise InvalidCampaignError(f"invalid campaign slug: {slug}")
+
+
+def normalize_website_url(value: str | None) -> str | None:
+    trimmed = _trimmed(value)
+    if trimmed is None:
+        return None
+
+    parsed = urlsplit(trimmed)
+    if parsed.scheme.casefold() not in {"http", "https"}:
+        return None
+    hostname = parsed.hostname
+    if hostname is None:
+        return None
+
+    scheme = parsed.scheme.casefold()
+    normalized_host = hostname.casefold().rstrip(".")
+    port = parsed.port
+    if (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
+        port = None
+
+    netloc = normalized_host if port is None else f"{normalized_host}:{port}"
+    path = parsed.path or "/"
+    normalized = SplitResult(
+        scheme=scheme,
+        netloc=netloc,
+        path=path,
+        query=parsed.query,
+        fragment="",
+    )
+    return urlunsplit(normalized)
 
 
 def registrable_domain(value: str | None) -> str | None:

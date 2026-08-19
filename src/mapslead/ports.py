@@ -9,6 +9,7 @@ from mapslead.models import (
     CampaignRecord,
     CampaignSnapshot,
     CampaignStatus,
+    EnrichmentCacheEntry,
     EnrichmentResult,
     ExportPaths,
     ProgressEvent,
@@ -94,10 +95,24 @@ class RepositoryPort(Protocol):
 
     def pending_enrichment(self, run_id: str) -> Sequence[RunSnapshot]: ...
 
+    def cached_enrichment(
+        self,
+        business_id: int,
+        website: str | None,
+    ) -> EnrichmentCacheEntry | None: ...
+
     def save_enrichment(
         self,
         run_id: str,
         business_id: int,
+        result: EnrichmentResult,
+        now: datetime,
+    ) -> None: ...
+
+    def save_cached_enrichment(
+        self,
+        business_id: int,
+        website: str,
         result: EnrichmentResult,
         now: datetime,
     ) -> None: ...
