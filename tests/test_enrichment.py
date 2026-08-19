@@ -532,3 +532,54 @@ def test_robot_checker_returns_warning_when_transport_rejects_unsafe_redirect() 
     assert allowed is True
     assert warning is not None
     assert "redirect changed registrable domain" in warning
+
+
+def test_default_service_composition_shares_pacing_between_robots_and_page_requests(
+    policy: UrlPolicy,
+) -> None:
+    clock = FakeClock()
+    sleep_calls: list[float] = []
+    requester = FakeRequester(
+        {
+            "https://example.com/robots.txt": [
+                TransportResponse(
+                    final_url="https://example.com/robots.txt",
+                    status_code=200,
+                    headers={"Content-Type": "text/plain; charset=utf-8"},
+                    body=b"User-agent: *\nAllow: /\n",
+                    peer_ip="93.184.216.34",
+                )
+            ],
+            "https://example.com": [
+                TransportResponse(
+                    final_url="https://example.com",
+                    status_code=200,
+                    headers={"Content-Type": "text/html; charset=utf-8"},
+                    body=b"<p>hello@example.com</p>",
+                    peer_ip="93.184.216.34",
+                )
+            ],
+        }
+    )
+
+    def sleeper(seconds: float) -> None:
+        sleep_calls.append(seconds)
+        clock.value += seconds
+
+    service = WebsiteEnrichmentService(
+        url_policy=policy,
+        requester=requester,
+        clock=clock,
+        sleeper=sleeper,
+    )
+
+    result = service.enrich("https://example.com")
+
+    assert result.status == EnrichmentStatus.COMPLETED
+    assert result.emails == ("hello@example.com",)
+    assert [request.url for request in requester.calls] == [
+        "https://example.com/robots.txt",
+        "https://example.com",
+    ]
+    assert sleep_calls == [2.0]
+    assert clock.monotonic() == 2.0

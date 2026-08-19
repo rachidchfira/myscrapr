@@ -59,3 +59,27 @@ Checks:
 
 Tradeoff:
 - The concrete page fetch adapter no longer relies on Scrapling for network I/O. Preserving Scrapling would have left peer selection and redirect handling inside a transport that does not expose a safe way to pin the actual connected IP to the validated DNS result, so the adapter now uses a minimal direct HTTP/HTTPS requester that keeps URL validation, connection target, peer verification, redirects, and robots retrieval inside one auditable boundary.
+
+---
+
+Review round 2
+
+Base for round: `eb9dea2`
+
+Finding addressed:
+- Default `WebsiteEnrichmentService` composition now builds one shared `SafeHttpTransport` when it must supply the page fetcher and/or robots checker itself, so `robots.txt` and page requests on the same registrable domain use the same pacing state and enforce the two-second spacing boundary across both request types.
+
+RED:
+- Command: `./.venv/bin/python -m pytest tests/test_enrichment.py -q`
+- Result: `1 failed, 22 passed`
+- Failing regression: `test_default_service_composition_shares_pacing_between_robots_and_page_requests` with `TypeError: WebsiteEnrichmentService.__init__() got an unexpected keyword argument 'requester'`
+
+GREEN:
+- Command: `./.venv/bin/python -m pytest tests/test_enrichment.py -q`
+- Result: `23 passed in 0.15s`
+
+Checks:
+- Command: `./.venv/bin/python -m ruff check src/mapslead/enrichment.py tests/test_enrichment.py`
+- Result: `All checks passed!`
+- Command: `./.venv/bin/python -m mypy src/mapslead`
+- Result: `Success: no issues found in 10 source files`

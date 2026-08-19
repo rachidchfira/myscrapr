@@ -284,22 +284,27 @@ class WebsiteEnrichmentService:
     def __init__(
         self,
         *,
-        page_fetcher: PageFetcher,
+        page_fetcher: PageFetcher | None = None,
         url_policy: UrlPolicy | None = None,
         robots_checker: RobotsChecker | None = None,
+        requester: Requester | None = None,
+        transport: SafeHttpTransport | None = None,
         clock: Clock | None = None,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
-        self._page_fetcher = page_fetcher
         self._url_policy = url_policy or UrlPolicy()
         safe_clock = clock or _SystemClock()
-        self._robots_checker = robots_checker or _RobotFileRobotsChecker(
-            transport=SafeHttpTransport(
+        shared_transport = transport
+        if shared_transport is None and (page_fetcher is None or robots_checker is None):
+            shared_transport = SafeHttpTransport(
                 url_policy=self._url_policy,
+                requester=requester,
                 clock=safe_clock,
                 sleeper=sleeper,
             )
-        )
+
+        self._page_fetcher = page_fetcher or ScraplingPageFetcher(shared_transport)
+        self._robots_checker = robots_checker or _RobotFileRobotsChecker(transport=shared_transport)
         self._clock = safe_clock
         self._sleeper = sleeper
 
