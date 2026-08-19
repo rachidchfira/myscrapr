@@ -106,10 +106,10 @@ def test_export_run_writes_sorted_csv_and_json_and_replaces_existing_pair(
     paths = exporter.export_run(run_id)
 
     expected_csv = (
-        "place_id,name,category,address,phone,website,rating,reviews_count,google_maps_url,emails,facebook,instagram,linkedin,x,youtube,first_seen_at,last_seen_at,run_id\n"
-        "place-alpha-1,alpha dental,,1 main st,,,,,,a@example.com;z@example.com,https://facebook.com/alpha,,,,,2026-08-19T10:00:00+00:00,2026-08-19T11:30:00+00:00,run-20260819\n"
-        "place-alpha-2, ALPHA DENTAL ,Orthodontist, 1 Main St ,+84 28 999 000,https://alpha-two.example,4.8,19,https://maps.google.com/?cid=alpha-two,c@example.com,,,https://linkedin.com/company/alpha-two,,,2026-08-19T10:00:00+00:00,2026-08-19T11:30:00+00:00,run-20260819\n"
-        "place-beta,Beta Dental,Dentist,2 Main St,+84 28 200 300,https://beta.example,4.2,8,https://maps.google.com/?cid=beta,,,,,,,2026-08-19T10:00:00+00:00,2026-08-19T11:30:00+00:00,run-20260819\n"
+        "place_id,name,category,address,phone,website,rating,review_count,google_maps_url,emails,facebook_url,instagram_url,linkedin_url,x_url,youtube_url,business_type,location_query,first_seen_at,last_seen_at,enrichment_status,enrichment_error,run_id\n"
+        "place-alpha-1,alpha dental,,1 main st,,,,,,a@example.com;z@example.com,https://facebook.com/alpha,,,,,dentists,HCMC,2026-08-19T10:00:00+00:00,2026-08-19T11:30:00+00:00,completed,,run-20260819\n"
+        "place-alpha-2, ALPHA DENTAL ,Orthodontist, 1 Main St ,+84 28 999 000,https://alpha-two.example,4.8,19,https://maps.google.com/?cid=alpha-two,c@example.com,,,https://linkedin.com/company/alpha-two,,,dentists,HCMC,2026-08-19T10:00:00+00:00,2026-08-19T11:30:00+00:00,pending,,run-20260819\n"
+        "place-beta,Beta Dental,Dentist,2 Main St,+84 28 200 300,https://beta.example,4.2,8,https://maps.google.com/?cid=beta,,,,,,,dentists,HCMC,2026-08-19T10:00:00+00:00,2026-08-19T11:30:00+00:00,failed,timeout,run-20260819\n"
     )
     expected_json = [
         {
@@ -120,16 +120,20 @@ def test_export_run_writes_sorted_csv_and_json_and_replaces_existing_pair(
             "phone": None,
             "website": None,
             "rating": None,
-            "reviews_count": None,
+            "review_count": None,
             "google_maps_url": None,
             "emails": ["a@example.com", "z@example.com"],
-            "facebook": "https://facebook.com/alpha",
-            "instagram": None,
-            "linkedin": None,
-            "x": None,
-            "youtube": None,
+            "facebook_url": "https://facebook.com/alpha",
+            "instagram_url": None,
+            "linkedin_url": None,
+            "x_url": None,
+            "youtube_url": None,
+            "business_type": "dentists",
+            "location_query": "HCMC",
             "first_seen_at": "2026-08-19T10:00:00+00:00",
             "last_seen_at": "2026-08-19T11:30:00+00:00",
+            "enrichment_status": "completed",
+            "enrichment_error": None,
             "run_id": "run-20260819",
         },
         {
@@ -140,16 +144,20 @@ def test_export_run_writes_sorted_csv_and_json_and_replaces_existing_pair(
             "phone": "+84 28 999 000",
             "website": "https://alpha-two.example",
             "rating": 4.8,
-            "reviews_count": 19,
+            "review_count": 19,
             "google_maps_url": "https://maps.google.com/?cid=alpha-two",
             "emails": ["c@example.com"],
-            "facebook": None,
-            "instagram": None,
-            "linkedin": "https://linkedin.com/company/alpha-two",
-            "x": None,
-            "youtube": None,
+            "facebook_url": None,
+            "instagram_url": None,
+            "linkedin_url": "https://linkedin.com/company/alpha-two",
+            "x_url": None,
+            "youtube_url": None,
+            "business_type": "dentists",
+            "location_query": "HCMC",
             "first_seen_at": "2026-08-19T10:00:00+00:00",
             "last_seen_at": "2026-08-19T11:30:00+00:00",
+            "enrichment_status": "pending",
+            "enrichment_error": None,
             "run_id": "run-20260819",
         },
         {
@@ -160,16 +168,20 @@ def test_export_run_writes_sorted_csv_and_json_and_replaces_existing_pair(
             "phone": "+84 28 200 300",
             "website": "https://beta.example",
             "rating": 4.2,
-            "reviews_count": 8,
+            "review_count": 8,
             "google_maps_url": "https://maps.google.com/?cid=beta",
             "emails": [],
-            "facebook": None,
-            "instagram": None,
-            "linkedin": None,
-            "x": None,
-            "youtube": None,
+            "facebook_url": None,
+            "instagram_url": None,
+            "linkedin_url": None,
+            "x_url": None,
+            "youtube_url": None,
+            "business_type": "dentists",
+            "location_query": "HCMC",
             "first_seen_at": "2026-08-19T10:00:00+00:00",
             "last_seen_at": "2026-08-19T11:30:00+00:00",
+            "enrichment_status": "failed",
+            "enrichment_error": "timeout",
             "run_id": "run-20260819",
         },
     ]
