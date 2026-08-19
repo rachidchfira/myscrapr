@@ -106,86 +106,71 @@ def test_export_run_writes_sorted_csv_and_json_and_replaces_existing_pair(
     paths = exporter.export_run(run_id)
 
     expected_csv = (
-        "business_id,run_id,name,business_type,location_query,first_seen_at,last_seen_at,place_id,category,address,phone,website,rating,review_count,google_maps_url,emails,facebook_url,instagram_url,linkedin_url,x_url,youtube_url,enrichment_status,enrichment_error\n"
-        "4,run-20260819,alpha dental,dentists,HCMC,2026-08-19T10:00:00+00:00,2026-08-19T11:30:00+00:00,place-alpha-1,,1 main st,,,,,,a@example.com;z@example.com,https://facebook.com/alpha,,,,,completed,\n"
-        "9,run-20260819, ALPHA DENTAL ,dentists,HCMC,2026-08-19T10:00:00+00:00,2026-08-19T11:30:00+00:00,place-alpha-2,Orthodontist, 1 Main St ,+84 28 999 000,https://alpha-two.example,4.8,19,https://maps.google.com/?cid=alpha-two,c@example.com,,,https://linkedin.com/company/alpha-two,,,pending,\n"
-        "7,run-20260819,Beta Dental,dentists,HCMC,2026-08-19T10:00:00+00:00,2026-08-19T11:30:00+00:00,place-beta,Dentist,2 Main St,+84 28 200 300,https://beta.example,4.2,8,https://maps.google.com/?cid=beta,,,,,,,failed,timeout\n"
+        "place_id,name,category,address,phone,website,rating,reviews_count,google_maps_url,emails,facebook,instagram,linkedin,x,youtube,first_seen_at,last_seen_at,run_id\n"
+        "place-alpha-1,alpha dental,,1 main st,,,,,,a@example.com;z@example.com,https://facebook.com/alpha,,,,,2026-08-19T10:00:00+00:00,2026-08-19T11:30:00+00:00,run-20260819\n"
+        "place-alpha-2, ALPHA DENTAL ,Orthodontist, 1 Main St ,+84 28 999 000,https://alpha-two.example,4.8,19,https://maps.google.com/?cid=alpha-two,c@example.com,,,https://linkedin.com/company/alpha-two,,,2026-08-19T10:00:00+00:00,2026-08-19T11:30:00+00:00,run-20260819\n"
+        "place-beta,Beta Dental,Dentist,2 Main St,+84 28 200 300,https://beta.example,4.2,8,https://maps.google.com/?cid=beta,,,,,,,2026-08-19T10:00:00+00:00,2026-08-19T11:30:00+00:00,run-20260819\n"
     )
     expected_json = [
         {
-            "business_id": 4,
-            "run_id": "run-20260819",
-            "name": "alpha dental",
-            "business_type": "dentists",
-            "location_query": "HCMC",
-            "first_seen_at": "2026-08-19T10:00:00+00:00",
-            "last_seen_at": "2026-08-19T11:30:00+00:00",
             "place_id": "place-alpha-1",
+            "name": "alpha dental",
             "category": None,
             "address": "1 main st",
             "phone": None,
             "website": None,
             "rating": None,
-            "review_count": None,
+            "reviews_count": None,
             "google_maps_url": None,
             "emails": ["a@example.com", "z@example.com"],
-            "facebook_url": "https://facebook.com/alpha",
-            "instagram_url": None,
-            "linkedin_url": None,
-            "x_url": None,
-            "youtube_url": None,
-            "enrichment_status": "completed",
-            "enrichment_error": None,
-        },
-        {
-            "business_id": 9,
-            "run_id": "run-20260819",
-            "name": " ALPHA DENTAL ",
-            "business_type": "dentists",
-            "location_query": "HCMC",
+            "facebook": "https://facebook.com/alpha",
+            "instagram": None,
+            "linkedin": None,
+            "x": None,
+            "youtube": None,
             "first_seen_at": "2026-08-19T10:00:00+00:00",
             "last_seen_at": "2026-08-19T11:30:00+00:00",
+            "run_id": "run-20260819",
+        },
+        {
             "place_id": "place-alpha-2",
+            "name": " ALPHA DENTAL ",
             "category": "Orthodontist",
             "address": " 1 Main St ",
             "phone": "+84 28 999 000",
             "website": "https://alpha-two.example",
             "rating": 4.8,
-            "review_count": 19,
+            "reviews_count": 19,
             "google_maps_url": "https://maps.google.com/?cid=alpha-two",
             "emails": ["c@example.com"],
-            "facebook_url": None,
-            "instagram_url": None,
-            "linkedin_url": "https://linkedin.com/company/alpha-two",
-            "x_url": None,
-            "youtube_url": None,
-            "enrichment_status": "pending",
-            "enrichment_error": None,
-        },
-        {
-            "business_id": 7,
-            "run_id": "run-20260819",
-            "name": "Beta Dental",
-            "business_type": "dentists",
-            "location_query": "HCMC",
+            "facebook": None,
+            "instagram": None,
+            "linkedin": "https://linkedin.com/company/alpha-two",
+            "x": None,
+            "youtube": None,
             "first_seen_at": "2026-08-19T10:00:00+00:00",
             "last_seen_at": "2026-08-19T11:30:00+00:00",
+            "run_id": "run-20260819",
+        },
+        {
             "place_id": "place-beta",
+            "name": "Beta Dental",
             "category": "Dentist",
             "address": "2 Main St",
             "phone": "+84 28 200 300",
             "website": "https://beta.example",
             "rating": 4.2,
-            "review_count": 8,
+            "reviews_count": 8,
             "google_maps_url": "https://maps.google.com/?cid=beta",
             "emails": [],
-            "facebook_url": None,
-            "instagram_url": None,
-            "linkedin_url": None,
-            "x_url": None,
-            "youtube_url": None,
-            "enrichment_status": "failed",
-            "enrichment_error": "timeout",
+            "facebook": None,
+            "instagram": None,
+            "linkedin": None,
+            "x": None,
+            "youtube": None,
+            "first_seen_at": "2026-08-19T10:00:00+00:00",
+            "last_seen_at": "2026-08-19T11:30:00+00:00",
+            "run_id": "run-20260819",
         },
     ]
 
@@ -254,6 +239,31 @@ def test_export_run_restores_existing_pair_when_second_replace_fails(
     assert csv_path.read_text(encoding="utf-8") == "stable csv\n"
     assert json_path.read_text(encoding="utf-8") == '{"stable": true}\n'
     assert sorted(path.name for path in run_dir.iterdir()) == ["results.csv", "results.json"]
+
+
+@pytest.mark.parametrize(
+    "unsafe_run_id",
+    (
+        "../escape",
+        "/absolute-run",
+        "nested/run",
+        "nested\\run",
+        ".",
+        "..",
+    ),
+)
+def test_export_run_rejects_unsafe_run_id(
+    settings: Settings,
+    snapshots: tuple[RunSnapshot, ...],
+    unsafe_run_id: str,
+) -> None:
+    repository = StubRepository({unsafe_run_id: snapshots})
+    exporter = Exporter(repository, settings)
+
+    with pytest.raises(ExportError, match="unsafe run_id"):
+        exporter.export_run(unsafe_run_id)
+
+    assert not settings.export_dir.exists()
 
 
 def _snapshot(

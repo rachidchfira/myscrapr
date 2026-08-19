@@ -16,29 +16,24 @@ from mapslead.normalize import normalize_text
 from mapslead.ports import RepositoryPort
 
 _CSV_FIELDNAMES = (
-    "business_id",
-    "run_id",
-    "name",
-    "business_type",
-    "location_query",
-    "first_seen_at",
-    "last_seen_at",
     "place_id",
+    "name",
     "category",
     "address",
     "phone",
     "website",
     "rating",
-    "review_count",
+    "reviews_count",
     "google_maps_url",
     "emails",
-    "facebook_url",
-    "instagram_url",
-    "linkedin_url",
-    "x_url",
-    "youtube_url",
-    "enrichment_status",
-    "enrichment_error",
+    "facebook",
+    "instagram",
+    "linkedin",
+    "x",
+    "youtube",
+    "first_seen_at",
+    "last_seen_at",
+    "run_id",
 )
 
 
@@ -83,6 +78,7 @@ class Exporter:
         self._settings = settings
 
     def export_run(self, run_id: str) -> ExportPaths:
+        run_dir = _validated_run_dir(self._settings.export_dir, run_id)
         snapshots = tuple(
             sorted(
                 self._repository.snapshots_for_run(run_id),
@@ -95,7 +91,6 @@ class Exporter:
         )
         rows = tuple(_prepare_row(snapshot) for snapshot in snapshots)
 
-        run_dir = self._settings.export_dir / run_id
         run_dir.mkdir(parents=True, exist_ok=True)
 
         csv_path = run_dir / "results.csv"
@@ -163,29 +158,24 @@ def _build_csv_document(rows: tuple[_PreparedRow, ...]) -> str:
 
 def _csv_row(row: _PreparedRow) -> dict[str, str | int | float | None]:
     return {
-        "business_id": row.business_id,
-        "run_id": row.run_id,
-        "name": row.name,
-        "business_type": row.business_type,
-        "location_query": row.location_query,
-        "first_seen_at": row.first_seen_at,
-        "last_seen_at": row.last_seen_at,
         "place_id": row.place_id,
+        "name": row.name,
         "category": row.category,
         "address": row.address,
         "phone": row.phone,
         "website": row.website,
         "rating": row.rating,
-        "review_count": row.review_count,
+        "reviews_count": row.review_count,
         "google_maps_url": row.google_maps_url,
         "emails": ";".join(row.emails),
-        "facebook_url": row.facebook_url,
-        "instagram_url": row.instagram_url,
-        "linkedin_url": row.linkedin_url,
-        "x_url": row.x_url,
-        "youtube_url": row.youtube_url,
-        "enrichment_status": row.enrichment_status,
-        "enrichment_error": row.enrichment_error,
+        "facebook": row.facebook_url,
+        "instagram": row.instagram_url,
+        "linkedin": row.linkedin_url,
+        "x": row.x_url,
+        "youtube": row.youtube_url,
+        "first_seen_at": row.first_seen_at,
+        "last_seen_at": row.last_seen_at,
+        "run_id": row.run_id,
     }
 
 
@@ -199,29 +189,24 @@ def _build_json_document(rows: tuple[_PreparedRow, ...]) -> str:
 
 def _json_row(row: _PreparedRow) -> dict[str, str | int | float | list[str] | None]:
     return {
-        "business_id": row.business_id,
-        "run_id": row.run_id,
-        "name": row.name,
-        "business_type": row.business_type,
-        "location_query": row.location_query,
-        "first_seen_at": row.first_seen_at,
-        "last_seen_at": row.last_seen_at,
         "place_id": row.place_id,
+        "name": row.name,
         "category": row.category,
         "address": row.address,
         "phone": row.phone,
         "website": row.website,
         "rating": row.rating,
-        "review_count": row.review_count,
+        "reviews_count": row.review_count,
         "google_maps_url": row.google_maps_url,
         "emails": list(row.emails),
-        "facebook_url": row.facebook_url,
-        "instagram_url": row.instagram_url,
-        "linkedin_url": row.linkedin_url,
-        "x_url": row.x_url,
-        "youtube_url": row.youtube_url,
-        "enrichment_status": row.enrichment_status,
-        "enrichment_error": row.enrichment_error,
+        "facebook": row.facebook_url,
+        "instagram": row.instagram_url,
+        "linkedin": row.linkedin_url,
+        "x": row.x_url,
+        "youtube": row.youtube_url,
+        "first_seen_at": row.first_seen_at,
+        "last_seen_at": row.last_seen_at,
+        "run_id": row.run_id,
     }
 
 
@@ -295,3 +280,19 @@ def _fsync_directory(path: Path) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _validated_run_dir(export_root: Path, run_id: str) -> Path:
+    if not run_id or run_id in {".", ".."}:
+        raise ExportError(f"unsafe run_id: {run_id!r}")
+
+    run_path = Path(run_id)
+    if run_path.is_absolute() or "/" in run_id or "\\" in run_id or len(run_path.parts) != 1:
+        raise ExportError(f"unsafe run_id: {run_id!r}")
+
+    resolved_export_root = export_root.resolve(strict=False)
+    resolved_run_dir = (resolved_export_root / run_id).resolve(strict=False)
+    if resolved_run_dir.parent != resolved_export_root:
+        raise ExportError(f"unsafe run_id: {run_id!r}")
+
+    return resolved_run_dir
