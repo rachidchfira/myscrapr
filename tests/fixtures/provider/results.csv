@@ -1,0 +1,3 @@
+title,place_id,category,address,phone,website,rating,reviews,link
+Alpha Dental,ChIJ-alpha,Dentist,1 Main St,+84 28 111 222,https://alpha.example,4.7,12,https://maps.google.com/?cid=alpha
+Beta Dental,ChIJ-beta,Dentist,2 Main St,+84 28 333 444,https://beta.example,4.2,8,https://maps.google.com/?cid=beta
