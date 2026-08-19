@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from openpyxl import load_workbook
 from typer.testing import CliRunner
 
 from mapslead import cli
@@ -256,6 +257,7 @@ def _export_paths(run_id: str) -> ExportPaths:
     return ExportPaths(
         csv_path=Path(f"/tmp/exports/{run_id}/results.csv"),
         json_path=Path(f"/tmp/exports/{run_id}/results.json"),
+        xlsx_path=Path(f"/tmp/exports/{run_id}/results.xlsx"),
     )
 
 
@@ -282,6 +284,7 @@ def _runtime(tmp_path: Path, *, service: Any, repository: Any | None = None, exp
         ExportPaths(
             csv_path=Path("/tmp/exports/campaigns/vietnam-dentists/results.csv"),
             json_path=Path("/tmp/exports/campaigns/vietnam-dentists/results.json"),
+            xlsx_path=Path("/tmp/exports/campaigns/vietnam-dentists/results.xlsx"),
         )
     )
     return FakeRuntime(
@@ -316,6 +319,7 @@ def test_scrape_command_passes_business_location_and_limit(tmp_path: Path, monke
 
     assert result.exit_code == 0
     assert "results.csv" in result.stdout
+    assert "results.xlsx" in result.stdout
     assert runtime.service.scrape_call == ("dentists", "HCMC", 25)
 
 
@@ -508,6 +512,7 @@ def test_resume_command_uses_run_id_and_reports_exports(
     assert result.exit_code == 0
     assert runtime.service.resume_call == "run-456"
     assert "results.json" in result.stdout
+    assert "results.xlsx" in result.stdout
 
 
 def test_export_command_regenerates_exports(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -526,6 +531,7 @@ def test_export_command_regenerates_exports(tmp_path: Path, monkeypatch: pytest.
     assert result.exit_code == 0
     assert exporter.calls == ["run-789"]
     assert "results.csv" in result.stdout
+    assert "results.xlsx" in result.stdout
 
 
 def test_campaign_create_attach_status_and_export_skip_prerequisite_checks(
@@ -631,6 +637,7 @@ def test_campaign_create_attach_status_and_export_skip_prerequisite_checks(
     assert "Locations: Hanoi, Ho Chi Minh City" in status_result.stdout
     assert "Remaining: 997" in status_result.stdout
     assert "campaigns/vietnam-dentists/results.csv" in export_result.stdout
+    assert "campaigns/vietnam-dentists/results.xlsx" in export_result.stdout
     assert captured_settings == [
         Settings(
             data_dir=cli_data_dir,
@@ -661,6 +668,7 @@ def test_scrape_reports_partial_and_blocked_runs_with_export_paths(
     assert result.exit_code == 0
     assert expected_phrase in result.stdout
     assert "results.csv" in result.stdout
+    assert "results.xlsx" in result.stdout
 
 
 def test_scrape_renders_progress_updates_and_final_exports(
@@ -701,6 +709,7 @@ def test_scrape_renders_progress_updates_and_final_exports(
     assert "Acquired 2 candidates (1 new)." in result.stdout
     assert "Enriched 1/1 websites." in result.stdout
     assert "/tmp/exports/run-123/results.csv" in result.stdout
+    assert "/tmp/exports/run-123/results.xlsx" in result.stdout
 
 
 def test_scrape_returns_exit_code_two_for_quota_exhaustion_without_traceback(
@@ -995,10 +1004,13 @@ def test_offline_end_to_end_scrape_quota_and_reexport_are_stable(
     run_id = run_dir.name
     csv_path = run_dir / "results.csv"
     json_path = run_dir / "results.json"
+    xlsx_path = run_dir / "results.xlsx"
     csv_rows = list(csv.DictReader(csv_path.open(encoding="utf-8", newline="")))
     json_rows = json.loads(json_path.read_text(encoding="utf-8"))
+    worksheet = load_workbook(xlsx_path)["Results"]
 
     assert scrape_result.stdout.count("results.csv") >= 1
+    assert scrape_result.stdout.count("results.xlsx") >= 1
     assert fetcher.requested_urls == [
         "https://example.com",
         "https://example.com/contact",
@@ -1057,11 +1069,16 @@ def test_offline_end_to_end_scrape_quota_and_reexport_are_stable(
             "run_id": run_id,
         }
     ]
+    assert worksheet["A2"].value == "place-1"
+    assert worksheet["G2"].value == 4.8
+    assert worksheet["H2"].value == 19
+    assert worksheet["J2"].value == "hello@example.com;sales@example.com"
     assert repository.get_run(run_id).status is RunStatus.COMPLETED
     assert repository.remaining_quota(FakeClock().now()) == DAILY_NEW_RECORD_LIMIT - 1
 
     initial_csv = csv_path.read_text(encoding="utf-8")
     initial_json = json_path.read_text(encoding="utf-8")
+    initial_xlsx = xlsx_path.read_bytes()
     export_result = runner.invoke(cli.app, ["export", "--run-id", run_id])
     quota_result = runner.invoke(cli.app, ["quota"])
 
@@ -1071,6 +1088,7 @@ def test_offline_end_to_end_scrape_quota_and_reexport_are_stable(
     assert "Remaining: 999" in quota_result.stdout
     assert csv_path.read_text(encoding="utf-8") == initial_csv
     assert json_path.read_text(encoding="utf-8") == initial_json
+    assert xlsx_path.read_bytes() == initial_xlsx
 
 
 def _resolver() -> Any:

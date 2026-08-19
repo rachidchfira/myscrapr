@@ -10,10 +10,12 @@ from pathlib import Path
 from mapslead.config import Settings
 from mapslead.errors import ExportError
 from mapslead.exporter import (
+    _build_xlsx_document,
     _cleanup_path,
-    _replace_export_pair,
+    _replace_export_targets,
     _replace_target,
-    _write_atomic_temp,
+    _write_atomic_bytes,
+    _write_atomic_text,
 )
 from mapslead.models import CampaignSnapshot, ExportPaths
 from mapslead.normalize import normalize_text, validate_campaign_slug
@@ -95,24 +97,32 @@ class CampaignExporter(CampaignExporterPort):
 
         csv_path = campaign_dir / "results.csv"
         json_path = campaign_dir / "results.json"
+        xlsx_path = campaign_dir / "results.xlsx"
         csv_temp_path = campaign_dir / "results.csv.tmp"
         json_temp_path = campaign_dir / "results.json.tmp"
+        xlsx_temp_path = campaign_dir / "results.xlsx.tmp"
 
         try:
-            _write_atomic_temp(csv_temp_path, _build_csv_document(rows))
-            _write_atomic_temp(json_temp_path, _build_json_document(rows))
-            _replace_export_pair(
+            _write_atomic_text(csv_temp_path, _build_csv_document(rows))
+            _write_atomic_text(json_temp_path, _build_json_document(rows))
+            _write_atomic_bytes(
+                xlsx_temp_path,
+                _build_xlsx_document(rows, CAMPAIGN_CSV_FIELDS, _csv_row),
+            )
+            _replace_export_targets(
                 (
                     _replace_target(csv_temp_path, csv_path),
                     _replace_target(json_temp_path, json_path),
+                    _replace_target(xlsx_temp_path, xlsx_path),
                 )
             )
         except Exception as error:
             _cleanup_path(csv_temp_path)
             _cleanup_path(json_temp_path)
+            _cleanup_path(xlsx_temp_path)
             raise ExportError(f"failed to export campaign {slug}") from error
 
-        return ExportPaths(csv_path=csv_path, json_path=json_path)
+        return ExportPaths(csv_path=csv_path, json_path=json_path, xlsx_path=xlsx_path)
 
 
 def _prepare_row(snapshot: CampaignSnapshot) -> _PreparedCampaignRow:

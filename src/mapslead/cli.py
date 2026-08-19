@@ -351,6 +351,7 @@ def _render_outcome(outcome: Any) -> None:
 def _render_export_paths(paths: ExportPaths) -> None:
     typer.echo(f"CSV: {paths.csv_path}")
     typer.echo(f"JSON: {paths.json_path}")
+    typer.echo(f"Excel: {paths.xlsx_path}")
 
 
 def _render_campaign_status(runtime: AppRuntime, status: CampaignStatus) -> None:
@@ -372,8 +373,9 @@ def _render_campaign_status(runtime: AppRuntime, status: CampaignStatus) -> None
     typer.echo(f"Remaining: {remaining}")
     csv_path = runtime.settings.export_dir / "campaigns" / status.campaign.slug / "results.csv"
     json_path = runtime.settings.export_dir / "campaigns" / status.campaign.slug / "results.json"
-    if csv_path.exists() and json_path.exists():
-        _render_export_paths(ExportPaths(csv_path=csv_path, json_path=json_path))
+    xlsx_path = runtime.settings.export_dir / "campaigns" / status.campaign.slug / "results.xlsx"
+    if csv_path.exists() and json_path.exists() and xlsx_path.exists():
+        _render_export_paths(ExportPaths(csv_path=csv_path, json_path=json_path, xlsx_path=xlsx_path))
 
 
 def _message_for_exception(error: BaseException) -> str:

@@ -1,15 +1,17 @@
 from __future__ import annotations
 
+import io
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from openpyxl import load_workbook
 
 from mapslead.config import Settings
 from mapslead.errors import ExportError
-from mapslead.exporter import Exporter
+from mapslead.exporter import _CSV_FIELDNAMES, Exporter
 from mapslead.models import EnrichmentStatus, RunSnapshot
 
 
@@ -91,7 +93,7 @@ def snapshots(run_id: str) -> tuple[RunSnapshot, ...]:
     )
 
 
-def test_export_run_writes_sorted_csv_and_json_and_replaces_existing_pair(
+def test_export_run_writes_sorted_csv_json_and_xlsx_and_replaces_existing_group(
     settings: Settings,
     run_id: str,
     snapshots: tuple[RunSnapshot, ...],
@@ -102,6 +104,7 @@ def test_export_run_writes_sorted_csv_and_json_and_replaces_existing_pair(
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "results.csv").write_text("old csv\n", encoding="utf-8")
     (run_dir / "results.json").write_text('{"old": true}\n', encoding="utf-8")
+    (run_dir / "results.xlsx").write_bytes(b"old xlsx")
 
     paths = exporter.export_run(run_id)
 
@@ -188,12 +191,33 @@ def test_export_run_writes_sorted_csv_and_json_and_replaces_existing_pair(
 
     assert paths.csv_path == run_dir / "results.csv"
     assert paths.json_path == run_dir / "results.json"
+    assert paths.xlsx_path == run_dir / "results.xlsx"
     assert paths.csv_path.read_text(encoding="utf-8") == expected_csv
     assert json.loads(paths.json_path.read_text(encoding="utf-8")) == expected_json
-    assert sorted(path.name for path in run_dir.iterdir()) == ["results.csv", "results.json"]
+    workbook = load_workbook(io.BytesIO(paths.xlsx_path.read_bytes()))
+    worksheet = workbook["Results"]
+
+    assert workbook.sheetnames == ["Results"]
+    assert worksheet.freeze_panes == "A2"
+    assert worksheet.auto_filter.ref == "A1:V4"
+    assert tuple(cell.value for cell in worksheet[1]) == _CSV_FIELDNAMES
+    assert worksheet["A2"].value == "place-alpha-1"
+    assert worksheet["B2"].value == "alpha dental"
+    assert worksheet["G2"].value is None
+    assert worksheet["G3"].value == 4.8
+    assert isinstance(worksheet["G3"].value, float)
+    assert worksheet["H3"].value == 19
+    assert isinstance(worksheet["H3"].value, int)
+    assert worksheet["J2"].value == "a@example.com;z@example.com"
+    assert worksheet["U4"].value == "timeout"
+    assert sorted(path.name for path in run_dir.iterdir()) == [
+        "results.csv",
+        "results.json",
+        "results.xlsx",
+    ]
 
 
-def test_export_run_preserves_existing_exports_when_json_serialization_fails(
+def test_export_run_preserves_existing_exports_when_xlsx_serialization_fails(
     settings: Settings,
     run_id: str,
     snapshots: tuple[RunSnapshot, ...],
@@ -205,23 +229,30 @@ def test_export_run_preserves_existing_exports_when_json_serialization_fails(
     run_dir.mkdir(parents=True, exist_ok=True)
     csv_path = run_dir / "results.csv"
     json_path = run_dir / "results.json"
+    xlsx_path = run_dir / "results.xlsx"
     csv_path.write_text("stable csv\n", encoding="utf-8")
     json_path.write_text('{"stable": true}\n', encoding="utf-8")
+    xlsx_path.write_bytes(b"stable xlsx")
 
-    def fail_json_dumps(*args: object, **kwargs: object) -> str:
-        raise TypeError("json exploded")
+    def fail_xlsx_build(*_args: object, **_kwargs: object) -> bytes:
+        raise ValueError("xlsx exploded")
 
-    monkeypatch.setattr("mapslead.exporter.json.dumps", fail_json_dumps)
+    monkeypatch.setattr("mapslead.exporter._build_xlsx_document", fail_xlsx_build)
 
     with pytest.raises(ExportError, match="run-20260819"):
         exporter.export_run(run_id)
 
     assert csv_path.read_text(encoding="utf-8") == "stable csv\n"
     assert json_path.read_text(encoding="utf-8") == '{"stable": true}\n'
-    assert sorted(path.name for path in run_dir.iterdir()) == ["results.csv", "results.json"]
+    assert xlsx_path.read_bytes() == b"stable xlsx"
+    assert sorted(path.name for path in run_dir.iterdir()) == [
+        "results.csv",
+        "results.json",
+        "results.xlsx",
+    ]
 
 
-def test_export_run_restores_existing_pair_when_second_replace_fails(
+def test_export_run_restores_existing_group_when_xlsx_replace_fails(
     settings: Settings,
     run_id: str,
     snapshots: tuple[RunSnapshot, ...],
@@ -233,24 +264,31 @@ def test_export_run_restores_existing_pair_when_second_replace_fails(
     run_dir.mkdir(parents=True, exist_ok=True)
     csv_path = run_dir / "results.csv"
     json_path = run_dir / "results.json"
+    xlsx_path = run_dir / "results.xlsx"
     csv_path.write_text("stable csv\n", encoding="utf-8")
     json_path.write_text('{"stable": true}\n', encoding="utf-8")
+    xlsx_path.write_bytes(b"stable xlsx")
 
     real_replace = __import__("os").replace
 
-    def fail_json_replace(src: str | Path, dst: str | Path) -> None:
-        if Path(src).name == "results.json.tmp" and Path(dst).name == "results.json":
+    def fail_xlsx_replace(src: str | Path, dst: str | Path) -> None:
+        if Path(src).name == "results.xlsx.tmp" and Path(dst).name == "results.xlsx":
             raise OSError("replace exploded")
         real_replace(src, dst)
 
-    monkeypatch.setattr("mapslead.exporter.os.replace", fail_json_replace)
+    monkeypatch.setattr("mapslead.exporter.os.replace", fail_xlsx_replace)
 
     with pytest.raises(ExportError, match="run-20260819"):
         exporter.export_run(run_id)
 
     assert csv_path.read_text(encoding="utf-8") == "stable csv\n"
     assert json_path.read_text(encoding="utf-8") == '{"stable": true}\n'
-    assert sorted(path.name for path in run_dir.iterdir()) == ["results.csv", "results.json"]
+    assert xlsx_path.read_bytes() == b"stable xlsx"
+    assert sorted(path.name for path in run_dir.iterdir()) == [
+        "results.csv",
+        "results.json",
+        "results.xlsx",
+    ]
 
 
 @pytest.mark.parametrize(

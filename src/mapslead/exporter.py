@@ -5,9 +5,15 @@ import io
 import json
 import os
 import uuid
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
+
+from openpyxl import Workbook
+from openpyxl.cell.cell import Cell
+from openpyxl.utils import get_column_letter
 
 from mapslead.config import Settings
 from mapslead.errors import ExportError
@@ -39,6 +45,10 @@ _CSV_FIELDNAMES = (
     "enrichment_error",
     "run_id",
 )
+
+_WORKBOOK_TIMESTAMP = datetime(2000, 1, 1, 0, 0, 0, tzinfo=UTC)
+_MAX_COLUMN_WIDTH = 60
+type _CellValue = str | int | float | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,28 +109,35 @@ class Exporter:
 
         csv_path = run_dir / "results.csv"
         json_path = run_dir / "results.json"
+        xlsx_path = run_dir / "results.xlsx"
         csv_temp_path = run_dir / "results.csv.tmp"
         json_temp_path = run_dir / "results.json.tmp"
+        xlsx_temp_path = run_dir / "results.xlsx.tmp"
 
         try:
             csv_document = _build_csv_document(rows)
-            _write_atomic_temp(csv_temp_path, csv_document)
+            _write_atomic_text(csv_temp_path, csv_document)
 
             json_document = _build_json_document(rows)
-            _write_atomic_temp(json_temp_path, json_document)
+            _write_atomic_text(json_temp_path, json_document)
 
-            _replace_export_pair(
+            xlsx_document = _build_xlsx_document(rows, _CSV_FIELDNAMES, _csv_row)
+            _write_atomic_bytes(xlsx_temp_path, xlsx_document)
+
+            _replace_export_targets(
                 (
                     _replace_target(csv_temp_path, csv_path),
                     _replace_target(json_temp_path, json_path),
+                    _replace_target(xlsx_temp_path, xlsx_path),
                 )
             )
         except Exception as error:
             _cleanup_path(csv_temp_path)
             _cleanup_path(json_temp_path)
+            _cleanup_path(xlsx_temp_path)
             raise ExportError(f"failed to export run {run_id}") from error
 
-        return ExportPaths(csv_path=csv_path, json_path=json_path)
+        return ExportPaths(csv_path=csv_path, json_path=json_path, xlsx_path=xlsx_path)
 
 
 def _prepare_row(snapshot: RunSnapshot) -> _PreparedRow:
@@ -222,8 +239,74 @@ def _json_row(row: _PreparedRow) -> dict[str, str | int | float | list[str] | No
     }
 
 
-def _write_atomic_temp(path: Path, document: str) -> None:
+def _build_xlsx_document[
+    RowT
+](
+    rows: Sequence[RowT],
+    fieldnames: Sequence[str],
+    row_builder: Callable[[RowT], dict[str, _CellValue]],
+) -> bytes:
+    workbook = Workbook()
+    workbook.properties.created = _WORKBOOK_TIMESTAMP
+    workbook.properties.modified = _WORKBOOK_TIMESTAMP
+    workbook.properties.lastModifiedBy = "mapslead"
+    workbook.properties.creator = "mapslead"
+
+    worksheet = workbook.active
+    worksheet.title = "Results"
+    worksheet.freeze_panes = "A2"
+
+    column_widths = [len(fieldname) for fieldname in fieldnames]
+    for column_index, fieldname in enumerate(fieldnames, start=1):
+        cell = worksheet.cell(row=1, column=column_index, value=fieldname)
+        cell.data_type = "s"
+
+    for row_index, row in enumerate(rows, start=2):
+        values = row_builder(row)
+        for column_index, fieldname in enumerate(fieldnames, start=1):
+            value = values[fieldname]
+            cell = worksheet.cell(row=row_index, column=column_index)
+            _assign_cell_value(cell, value)
+            display_value = "" if value is None else str(value)
+            column_widths[column_index - 1] = max(column_widths[column_index - 1], len(display_value))
+
+    last_column = get_column_letter(len(fieldnames))
+    worksheet.auto_filter.ref = f"A1:{last_column}{max(len(rows) + 1, 1)}"
+    for column_index, width in enumerate(column_widths, start=1):
+        worksheet.column_dimensions[get_column_letter(column_index)].width = min(width + 2, _MAX_COLUMN_WIDTH)
+
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+def _assign_cell_value(cell: Cell, value: _CellValue) -> None:
+    if value is None:
+        cell.value = None
+        return
+    if isinstance(value, bool):
+        cell.value = str(value)
+        cell.data_type = "s"
+        return
+    if isinstance(value, int):
+        cell.value = value
+        return
+    if isinstance(value, float):
+        cell.value = value
+        return
+    cell.value = value
+    cell.data_type = "s"
+
+
+def _write_atomic_text(path: Path, document: str) -> None:
     with path.open("w", encoding="utf-8", newline="") as handle:
+        handle.write(document)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _write_atomic_bytes(path: Path, document: bytes) -> None:
+    with path.open("wb") as handle:
         handle.write(document)
         handle.flush()
         os.fsync(handle.fileno())
@@ -239,12 +322,16 @@ def _replace_target(temp_path: Path, destination_path: Path) -> _ReplaceTarget:
     )
 
 
-def _replace_export_pair(targets: tuple[_ReplaceTarget, _ReplaceTarget]) -> None:
+def _replace_export_targets(targets: tuple[_ReplaceTarget, ...]) -> None:
     prepared: list[_ReplaceTarget] = []
     replaced: list[_ReplaceTarget] = []
+    if not targets:
+        raise ValueError("export target group cannot be empty")
     directory = targets[0].destination_path.parent
     try:
         for target in targets:
+            if target.destination_path.parent != directory:
+                raise ValueError("export targets must share a directory")
             if target.destination_existed:
                 os.replace(target.destination_path, target.backup_path)
             prepared.append(target)

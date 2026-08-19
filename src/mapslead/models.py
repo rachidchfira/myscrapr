@@ -171,6 +171,7 @@ class RunRecord(FrozenModel):
 class ExportPaths(FrozenModel):
     csv_path: Path
     json_path: Path
+    xlsx_path: Path
 
 
 class ProgressEvent(FrozenModel):

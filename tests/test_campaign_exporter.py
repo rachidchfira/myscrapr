@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import io
 import json
 import os
 from dataclasses import dataclass
@@ -8,6 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
+from openpyxl import load_workbook
 
 from mapslead.config import Settings
 from mapslead.errors import ExportError
@@ -91,7 +93,7 @@ def snapshots(campaign_slug: str) -> tuple[CampaignSnapshot, ...]:
     )
 
 
-def test_export_campaign_writes_sorted_csv_and_json_and_replaces_existing_pair(
+def test_export_campaign_writes_sorted_csv_json_and_xlsx_and_replaces_existing_group(
     settings: Settings,
     campaign_slug: str,
     snapshots: tuple[CampaignSnapshot, ...],
@@ -104,16 +106,20 @@ def test_export_campaign_writes_sorted_csv_and_json_and_replaces_existing_pair(
     campaign_dir.mkdir(parents=True, exist_ok=True)
     (campaign_dir / "results.csv").write_text("old csv\n", encoding="utf-8")
     (campaign_dir / "results.json").write_text('{"old": true}\n', encoding="utf-8")
+    (campaign_dir / "results.xlsx").write_bytes(b"old xlsx")
 
     paths = exporter.export_campaign(campaign_slug)
 
     with paths.csv_path.open(encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
     payload = json.loads(paths.json_path.read_text(encoding="utf-8"))
+    workbook = load_workbook(io.BytesIO(paths.xlsx_path.read_bytes()))
+    worksheet = workbook["Results"]
 
     assert tuple(rows[0].keys()) == CAMPAIGN_CSV_FIELDS
     assert paths.csv_path == campaign_dir / "results.csv"
     assert paths.json_path == campaign_dir / "results.json"
+    assert paths.xlsx_path == campaign_dir / "results.xlsx"
     assert rows[0]["name"] == "alpha dental"
     assert rows[0]["emails"] == "a@example.com;z@example.com"
     assert rows[1]["discovered_in"] == "Hanoi;Ho Chi Minh City"
@@ -122,10 +128,22 @@ def test_export_campaign_writes_sorted_csv_and_json_and_replaces_existing_pair(
     assert payload[1]["discovered_in"] == ["Hanoi", "Ho Chi Minh City"]
     assert payload[2]["enrichment_error"] == "timeout"
     assert payload[0]["website"] is None
-    assert sorted(path.name for path in campaign_dir.iterdir()) == ["results.csv", "results.json"]
+    assert workbook.sheetnames == ["Results"]
+    assert worksheet.freeze_panes == "A2"
+    assert worksheet.auto_filter.ref == "A1:V4"
+    assert tuple(cell.value for cell in worksheet[1]) == CAMPAIGN_CSV_FIELDS
+    assert worksheet["A2"].value == "place-alpha-1"
+    assert worksheet["V3"].value == "Hanoi;Ho Chi Minh City"
+    assert worksheet["G3"].value == 4.8
+    assert isinstance(worksheet["H3"].value, int)
+    assert sorted(path.name for path in campaign_dir.iterdir()) == [
+        "results.csv",
+        "results.json",
+        "results.xlsx",
+    ]
 
 
-def test_export_campaign_preserves_existing_exports_when_json_serialization_fails(
+def test_export_campaign_preserves_existing_exports_when_xlsx_serialization_fails(
     settings: Settings,
     campaign_slug: str,
     snapshots: tuple[CampaignSnapshot, ...],
@@ -139,23 +157,30 @@ def test_export_campaign_preserves_existing_exports_when_json_serialization_fail
     campaign_dir.mkdir(parents=True, exist_ok=True)
     csv_path = campaign_dir / "results.csv"
     json_path = campaign_dir / "results.json"
+    xlsx_path = campaign_dir / "results.xlsx"
     csv_path.write_text("stable csv\n", encoding="utf-8")
     json_path.write_text('{"stable": true}\n', encoding="utf-8")
+    xlsx_path.write_bytes(b"stable xlsx")
 
-    def fail_json_dumps(*args: object, **kwargs: object) -> str:
-        raise TypeError("json exploded")
+    def fail_xlsx_build(*_args: object, **_kwargs: object) -> bytes:
+        raise ValueError("xlsx exploded")
 
-    monkeypatch.setattr("mapslead.campaign_exporter.json.dumps", fail_json_dumps)
+    monkeypatch.setattr("mapslead.campaign_exporter._build_xlsx_document", fail_xlsx_build)
 
     with pytest.raises(ExportError, match=campaign_slug):
         exporter.export_campaign(campaign_slug)
 
     assert csv_path.read_text(encoding="utf-8") == "stable csv\n"
     assert json_path.read_text(encoding="utf-8") == '{"stable": true}\n'
-    assert sorted(path.name for path in campaign_dir.iterdir()) == ["results.csv", "results.json"]
+    assert xlsx_path.read_bytes() == b"stable xlsx"
+    assert sorted(path.name for path in campaign_dir.iterdir()) == [
+        "results.csv",
+        "results.json",
+        "results.xlsx",
+    ]
 
 
-def test_export_campaign_restores_existing_pair_when_second_replace_fails(
+def test_export_campaign_restores_existing_group_when_xlsx_replace_fails(
     settings: Settings,
     campaign_slug: str,
     snapshots: tuple[CampaignSnapshot, ...],
@@ -169,24 +194,31 @@ def test_export_campaign_restores_existing_pair_when_second_replace_fails(
     campaign_dir.mkdir(parents=True, exist_ok=True)
     csv_path = campaign_dir / "results.csv"
     json_path = campaign_dir / "results.json"
+    xlsx_path = campaign_dir / "results.xlsx"
     csv_path.write_text("stable csv\n", encoding="utf-8")
     json_path.write_text('{"stable": true}\n', encoding="utf-8")
+    xlsx_path.write_bytes(b"stable xlsx")
 
     real_replace = os.replace
 
-    def fail_json_replace(src: str | Path, dst: str | Path) -> None:
-        if Path(src).name == "results.json.tmp" and Path(dst).name == "results.json":
+    def fail_xlsx_replace(src: str | Path, dst: str | Path) -> None:
+        if Path(src).name == "results.xlsx.tmp" and Path(dst).name == "results.xlsx":
             raise OSError("replace exploded")
         real_replace(src, dst)
 
-    monkeypatch.setattr("mapslead.campaign_exporter.os.replace", fail_json_replace)
+    monkeypatch.setattr("mapslead.campaign_exporter.os.replace", fail_xlsx_replace)
 
     with pytest.raises(ExportError, match=campaign_slug):
         exporter.export_campaign(campaign_slug)
 
     assert csv_path.read_text(encoding="utf-8") == "stable csv\n"
     assert json_path.read_text(encoding="utf-8") == '{"stable": true}\n'
-    assert sorted(path.name for path in campaign_dir.iterdir()) == ["results.csv", "results.json"]
+    assert xlsx_path.read_bytes() == b"stable xlsx"
+    assert sorted(path.name for path in campaign_dir.iterdir()) == [
+        "results.csv",
+        "results.json",
+        "results.xlsx",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -253,10 +285,12 @@ def test_export_campaign_is_byte_identical_on_reexport(
     first = exporter.export_campaign(campaign_slug)
     first_csv = first.csv_path.read_bytes()
     first_json = first.json_path.read_bytes()
+    first_xlsx = first.xlsx_path.read_bytes()
     second = exporter.export_campaign(campaign_slug)
 
     assert second.csv_path.read_bytes() == first_csv
     assert second.json_path.read_bytes() == first_json
+    assert second.xlsx_path.read_bytes() == first_xlsx
 
 
 def _snapshot(

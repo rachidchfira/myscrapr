@@ -1,6 +1,6 @@
 # MapsLead
 
-MapsLead is a local CLI for collecting Google Maps lead candidates, enriching business websites, and exporting each run as CSV and JSON. It also supports isolated nationwide campaigns so you can scrape one niche across many cities without mixing business types or exporting the same business twice.
+MapsLead is a local CLI for collecting Google Maps lead candidates, enriching business websites, and exporting each run as CSV, JSON, and Excel. It also supports isolated nationwide campaigns so you can scrape one niche across many cities without mixing business types or exporting the same business twice.
 
 ## Requirements
 
@@ -57,11 +57,11 @@ Progress output stays concise:
 - acquisition updates show accepted candidate and new-unique counts
 - enrichment updates show completed website enrichments
 - cached-enrichment updates show reuse without refetching a website
-- export updates print the final CSV and JSON paths
+- export updates print the final CSV, JSON, and Excel paths
 
 ## Campaign Workflow
 
-Campaigns isolate one normalized business type, keep deduplication and quota global, and write one master CSV/JSON pair per campaign under `exports/campaigns/<slug>/`.
+Campaigns isolate one normalized business type, keep deduplication and quota global, and write one master CSV/JSON/Excel export set per campaign under `exports/campaigns/<slug>/`.
 
 Use this workflow for the Vietnam dentist campaign:
 
@@ -79,15 +79,15 @@ Rules that stay in force:
 - The daily `1000` new-unique quota stays global across campaign and non-campaign runs.
 - Successful website enrichment is reused while the normalized website URL stays the same.
 - `--refresh-enrichment` forces website refetching for that run and stays persisted for resume.
-- Campaign master exports are written to `exports/campaigns/<slug>/results.csv` and `results.json`.
+- Campaign master exports are written to `exports/campaigns/<slug>/results.csv`, `results.json`, and `results.xlsx`.
 
 ## Quota And Storage
 
 - Daily quota is fixed at `1000` new unique records per local day in the configured timezone.
 - The default requested limit is `200`.
 - SQLite state lives under `data/mapslead.sqlite3` unless you override `--data-dir` or `MAPSLEAD_DATA_DIR`.
-- Per-run exports live under `exports/<run-id>/results.csv` and `exports/<run-id>/results.json` unless you override `--export-dir` or `MAPSLEAD_EXPORT_DIR`.
-- Campaign exports live under `exports/campaigns/<slug>/results.csv` and `exports/campaigns/<slug>/results.json`.
+- Per-run exports live under `exports/<run-id>/results.csv`, `results.json`, and `results.xlsx` unless you override `--export-dir` or `MAPSLEAD_EXPORT_DIR`.
+- Campaign exports live under `exports/campaigns/<slug>/results.csv`, `results.json`, and `results.xlsx`.
 - `data/` and `exports/` are local working directories and are not intended to be pushed to GitHub.
 
 Check quota at any time:
@@ -138,8 +138,8 @@ This is the manual smoke path for a real networked run. Keep it capped at five r
 
 1. Ensure Docker is running and the provider image is present: `docker pull gosom/google-maps-scraper`
 2. Start a small run: `.venv/bin/mapslead --data-dir ./smoke-data --export-dir ./smoke-exports scrape --business "dentists" --location "Ho Chi Minh City" --limit 5`
-3. Confirm the CLI prints a run ID plus `results.csv` and `results.json` paths.
-4. Inspect `./smoke-exports/<run-id>/results.csv` and `./smoke-exports/<run-id>/results.json`.
+3. Confirm the CLI prints a run ID plus `results.csv`, `results.json`, and `results.xlsx` paths.
+4. Inspect `./smoke-exports/<run-id>/results.csv`, `./smoke-exports/<run-id>/results.json`, and `./smoke-exports/<run-id>/results.xlsx`.
 5. Re-run `.venv/bin/mapslead --data-dir ./smoke-data --export-dir ./smoke-exports quota` and confirm `Used today: 5`.
 
 ## Test Commands
