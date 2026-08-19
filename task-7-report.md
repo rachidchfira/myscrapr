@@ -84,7 +84,7 @@ Coverage specifics:
 
 ## Remaining Environment-Level Checks
 
-- A real live smoke run with Docker, the provider image, Google Maps access, and Chromium installed was documented but not executed in automation.
+- A real live smoke run with Docker, the provider image, and Google Maps access was documented but not executed in automation.
 - Resume against an actual interrupted Docker-backed run still needs manual validation in the target operator machine.
 - Shell completion generation was not requested and was not added.
 
@@ -92,13 +92,13 @@ Coverage specifics:
 
 Residual risk:
 
-- The CLI prerequisite checker intentionally maps several Playwright/bootstrap failures to the single Chromium remediation message. That is the safest operator-facing default here, but it can mask the exact low-level Playwright cause.
+- Docker daemon, provider-image, and upstream Google Maps behavior still require validation on the operator machine.
 
 Prioritized follow-up:
 
 1. Run the documented five-record live smoke on the target workstation.
 2. Capture one real blocked/partial provider run and verify the `resume` operator path with Docker present.
-3. If operators need finer diagnostics later, split Playwright import/bootstrap failures from missing-browser failures without changing the current command contract.
+3. Confirm the Docker/provider remediation messages on the target workstation.
 
 ## Review Fix Round 1
 
@@ -151,5 +151,5 @@ GREEN result:
 
 ### Compatibility Note
 
-- I did not edit `pyproject.toml` because it is outside the owned file set for this task round.
-- Follow-up for parent: re-evaluate whether `scrapling` and any Playwright/browser-related runtime dependency expectations should remain in project metadata now that operator-time enrichment uses the direct HTTP transport path.
+- Parent follow-up removed the obsolete Scrapling/browser dependency from `pyproject.toml`.
+- Parent follow-up added the directly imported `tld` package to runtime dependencies and verified a clean wheel install/import/CLI smoke in a temporary Python 3.12 environment.
