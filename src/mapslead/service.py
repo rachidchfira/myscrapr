@@ -112,6 +112,8 @@ class MapsLeadService:
                 progress=progress,
             ),
         )
+        if self._final_status(provider_result) is not RunStatus.COMPLETED:
+            return self._complete_run(run.id, now, provider_result, progress)
 
         remaining_capacity = max(0, run.requested_limit - self._repository.new_unique_count_for_run(run.id))
         remaining_quota = self._repository.remaining_quota(now)

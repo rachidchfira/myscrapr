@@ -636,6 +636,67 @@ def test_resume_at_requested_limit_replays_and_exports_without_new_acquisition(
     assert snapshot.emails == ("resume@example.com",)
 
 
+@pytest.mark.parametrize(
+    ("replay_status", "diagnostics"),
+    [
+        ("failed", "replay failed after durable rows"),
+        ("blocked", "replay detected blocking"),
+        ("partial", "replay remained partial"),
+    ],
+)
+def test_resume_non_completed_replay_preserves_status_and_skips_fresh_acquisition(
+    repository: SQLiteRepository,
+    exporter: Exporter,
+    now: datetime,
+    replay_status: str,
+    diagnostics: str,
+) -> None:
+    run = repository.create_run("dentists", "HCMC", 3, now)
+    repository.accept_candidate(
+        run.id,
+        candidate_for(1, website="https://replay-terminal.example.com"),
+        now,
+    )
+    repository.set_run_status(run.id, RunStatus.PARTIAL, finished_at=now, error="resume me")
+
+    provider = FakeProvider(
+        replay_scripts=[
+            ProviderScript(
+                candidates=(candidate_for(1, website="https://replay-terminal.example.com"),),
+                result=ProviderResult(
+                    status=replay_status,
+                    candidate_count=1,
+                    rejected_row_count=0,
+                    diagnostics_tail=diagnostics,
+                    interrupted=False,
+                ),
+            )
+        ],
+        acquire_scripts=[
+            ProviderScript(
+                candidates=(candidate_for(2, website="https://should-not-run.example.com"),),
+                result=ProviderResult(
+                    status="completed",
+                    candidate_count=1,
+                    rejected_row_count=0,
+                    diagnostics_tail="unexpected acquire",
+                ),
+            )
+        ],
+    )
+    service = MapsLeadService(repository, provider, FakeEnricher(), exporter)
+
+    outcome = service.resume(run.id, now, _progress_sink([]))
+
+    assert provider.call_log == ["replay"]
+    assert provider.acquire_requests == []
+    expected_status = RunStatus(replay_status)
+    assert outcome.run.status is expected_status
+    assert outcome.run.error == diagnostics
+    assert outcome.export_paths is not None
+    assert len(load_export_json(outcome)) == 1
+
+
 def test_export_failure_keeps_records_durable_and_preserves_provider_status(
     repository: SQLiteRepository,
     exporter: Exporter,
