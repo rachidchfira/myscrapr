@@ -225,15 +225,19 @@ class SQLiteRepository:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT snapshot_json
+                SELECT run_businesses.snapshot_json, businesses.canonical_json
                 FROM run_businesses
+                INNER JOIN businesses ON businesses.id = run_businesses.business_id
                 WHERE run_id = ?
                   AND enrichment_status != ?
-                ORDER BY business_id
+                ORDER BY run_businesses.business_id
                 """,
                 (run_id, EnrichmentStatus.COMPLETED.value),
             ).fetchall()
-        snapshots = tuple(RunSnapshot.model_validate_json(str(row["snapshot_json"])) for row in rows)
+        snapshots = tuple(
+            self._snapshot_for_pending_enrichment(row)
+            for row in rows
+        )
         return tuple(snapshot for snapshot in snapshots if _has_http_website(snapshot.website))
 
     def save_enrichment(
@@ -584,6 +588,17 @@ class SQLiteRepository:
             ),
         )
         return snapshot
+
+    def _snapshot_for_pending_enrichment(self, row: sqlite3.Row) -> RunSnapshot:
+        snapshot = RunSnapshot.model_validate_json(str(row["snapshot_json"]))
+        if _has_http_website(snapshot.website):
+            return snapshot
+
+        canonical = _CanonicalBusiness.model_validate_json(str(row["canonical_json"]))
+        if not _has_http_website(canonical.website):
+            return snapshot
+
+        return snapshot.model_copy(update={"website": canonical.website})
 
 
 def _has_http_website(value: str | None) -> bool:

@@ -171,6 +171,69 @@ def test_reused_business_is_pending_enrichment_for_new_run(
     assert pending[0].enrichment_status == EnrichmentStatus.PENDING
 
 
+def test_pending_enrichment_uses_canonical_website_learned_later_in_same_run(
+    repository: SQLiteRepository,
+    now: datetime,
+) -> None:
+    run = repository.create_run("dentists", "HCMC", 10, now)
+    first = repository.accept_candidate(
+        run.id,
+        ProviderCandidate(name="Example Dental", place_id="ChIJ-123"),
+        now,
+    )
+    assert repository.pending_enrichment(run.id) == ()
+
+    repository.accept_candidate(
+        run.id,
+        ProviderCandidate(
+            name="Example Dental",
+            place_id="ChIJ-123",
+            website="https://example.com",
+        ),
+        now,
+    )
+
+    pending = repository.pending_enrichment(run.id)
+    snapshot = repository.snapshots_for_run(run.id)[0]
+
+    assert [item.business_id for item in pending] == [first.business_id]
+    assert pending[0].website == "https://example.com"
+    assert snapshot.website is None
+
+
+def test_pending_enrichment_uses_canonical_website_for_later_run_reuse_without_mutating_older_snapshot(
+    repository: SQLiteRepository,
+    now: datetime,
+) -> None:
+    first_run = repository.create_run("dentists", "HCMC", 10, now)
+    repository.accept_candidate(
+        first_run.id,
+        ProviderCandidate(
+            name="Example Dental",
+            place_id="ChIJ-123",
+            website="https://example.com",
+        ),
+        now,
+    )
+
+    second_run = repository.create_run("dentists", "HCMC", 10, now)
+    acceptance = repository.accept_candidate(
+        second_run.id,
+        ProviderCandidate(name="Example Dental", place_id="ChIJ-123"),
+        now,
+    )
+
+    pending = repository.pending_enrichment(second_run.id)
+    first_snapshot = repository.snapshots_for_run(first_run.id)[0]
+    second_snapshot = repository.snapshots_for_run(second_run.id)[0]
+
+    assert acceptance.is_new is False
+    assert [item.business_id for item in pending] == [acceptance.business_id]
+    assert pending[0].website == "https://example.com"
+    assert first_snapshot.website == "https://example.com"
+    assert second_snapshot.website is None
+
+
 def test_save_enrichment_marks_snapshot_complete_for_run(
     repository: SQLiteRepository,
     now: datetime,
