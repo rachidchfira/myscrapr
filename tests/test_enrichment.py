@@ -6,7 +6,16 @@ from pathlib import Path
 
 import pytest
 
-from mapslead.enrichment import FetchedPage, UrlPolicy, WebsiteEnrichmentService
+from mapslead.enrichment import (
+    FetchedPage,
+    SafeHttpTransport,
+    TransportRequest,
+    TransportResponse,
+    UrlPolicy,
+    WebsiteEnrichmentService,
+    _discover_candidate_pages,
+    _RobotFileRobotsChecker,
+)
 from mapslead.errors import UnsafeUrlError
 from mapslead.models import EnrichmentStatus
 
@@ -51,6 +60,33 @@ class FakeClock:
 
     def monotonic(self) -> float:
         return self.value
+
+
+@dataclass
+class FakeRequester:
+    responses: dict[str, list[TransportResponse]]
+    calls: list[TransportRequest] = field(default_factory=list)
+
+    def fetch(self, request: TransportRequest) -> TransportResponse:
+        self.calls.append(request)
+        queued = self.responses[request.url]
+        if not queued:
+            raise AssertionError(f"no queued response for {request.url}")
+        return queued.pop(0)
+
+
+@dataclass
+class FakeTransport:
+    responses: dict[str, TransportResponse | Exception]
+    requested_urls: list[str] = field(default_factory=list)
+
+    def get(self, url: str, *, allowed_registrable_domain: str | None = None) -> TransportResponse:
+        del allowed_registrable_domain
+        self.requested_urls.append(url)
+        response = self.responses[url]
+        if isinstance(response, Exception):
+            raise response
+        return response
 
 
 @pytest.fixture
@@ -274,6 +310,37 @@ def test_enrichment_skips_robots_disallowed_and_non_page_links(
     ]
 
 
+def test_enrichment_rechecks_robots_after_redirect_and_skips_disallowed_final_page(
+    policy: UrlPolicy,
+) -> None:
+    robots = FakeRobotsChecker(
+        decisions={
+            "https://example.com": (True, None),
+            "https://blog.example.com/contact": (False, None),
+        }
+    )
+    service, fetcher, _, _ = build_service(
+        {
+            "https://example.com": FetchedPage(
+                final_url="https://blog.example.com/contact",
+                html="<p>hello@example.com</p>",
+            ),
+        },
+        policy=policy,
+        robots_checker=robots,
+    )
+
+    result = service.enrich("https://example.com")
+
+    assert result.status == EnrichmentStatus.COMPLETED
+    assert result.emails == ()
+    assert fetcher.requested_urls == ["https://example.com"]
+    assert robots.checked_urls == [
+        "https://example.com",
+        "https://blog.example.com/contact",
+    ]
+
+
 def test_enrichment_records_warning_when_robots_lookup_fails(
     policy: UrlPolicy,
 ) -> None:
@@ -301,43 +368,75 @@ def test_enrichment_records_warning_when_robots_lookup_fails(
 
 
 def test_enrichment_enforces_two_second_spacing_per_registrable_domain(
-    policy: UrlPolicy,
-    home_html: str,
-    contact_html: str,
+    resolver: FakeResolver,
 ) -> None:
+    clock = FakeClock()
     sleep_calls: list[float] = []
-    service, fetcher, clock, _ = build_service(
+    requester = FakeRequester(
         {
-            "https://example.com": FetchedPage(final_url="https://example.com", html=home_html),
-            "https://example.com/contact": FetchedPage(
-                final_url="https://example.com/contact",
-                html=contact_html,
-            ),
-            "https://example.com/about": FetchedPage(
-                final_url="https://example.com/about",
-                html="<p>About</p>",
-            ),
-            "https://example.com/team": FetchedPage(
-                final_url="https://example.com/team",
-                html="<p>Team</p>",
-            ),
-        },
-        policy=policy,
-        clock=FakeClock(),
-        sleep_calls=sleep_calls,
+            "https://example.com": [
+                TransportResponse(
+                    final_url="https://example.com",
+                    status_code=302,
+                    headers={"Location": "https://blog.example.com/contact"},
+                    body=b"",
+                    peer_ip="93.184.216.34",
+                )
+            ],
+            "https://blog.example.com/contact": [
+                TransportResponse(
+                    final_url="https://blog.example.com/contact",
+                    status_code=200,
+                    headers={},
+                    body=b"<p>hello@example.com</p>",
+                    peer_ip="93.184.216.34",
+                )
+            ],
+        }
+    )
+    transport = SafeHttpTransport(
+        url_policy=UrlPolicy(resolver=resolver),
+        requester=requester,
+        clock=clock,
+        sleeper=lambda seconds: (sleep_calls.append(seconds), setattr(clock, "value", clock.value + seconds)),
     )
 
-    result = service.enrich("https://example.com")
+    response = transport.get("https://example.com")
 
-    assert result.status == EnrichmentStatus.COMPLETED
-    assert fetcher.requested_urls == [
+    assert response.final_url == "https://blog.example.com/contact"
+    assert [request.url for request in requester.calls] == [
         "https://example.com",
-        "https://example.com/contact",
-        "https://example.com/about",
-        "https://example.com/team",
+        "https://blog.example.com/contact",
     ]
-    assert sleep_calls == [2.0, 2.0, 2.0]
-    assert clock.monotonic() == 6.0
+    assert sleep_calls == [2.0]
+    assert clock.monotonic() == 2.0
+
+
+def test_safe_transport_rejects_connected_peer_that_differs_from_resolved_ip(
+    resolver: FakeResolver,
+) -> None:
+    requester = FakeRequester(
+        {
+            "https://example.com": [
+                TransportResponse(
+                    final_url="https://example.com",
+                    status_code=200,
+                    headers={},
+                    body=b"<p>hello@example.com</p>",
+                    peer_ip="127.0.0.1",
+                )
+            ]
+        }
+    )
+    transport = SafeHttpTransport(
+        url_policy=UrlPolicy(resolver=resolver),
+        requester=requester,
+        clock=FakeClock(),
+        sleeper=lambda seconds: None,
+    )
+
+    with pytest.raises(UnsafeUrlError, match="connected peer"):
+        transport.get("https://example.com")
 
 
 def test_enrichment_fetch_failure_returns_failed_result_instead_of_raising(
@@ -386,3 +485,50 @@ def test_enrichment_accepts_bare_domains_by_normalizing_to_https(policy: UrlPoli
     assert result.status == EnrichmentStatus.COMPLETED
     assert fetcher.requested_urls == ["https://example.com"]
     assert result.emails == ("hello@example.com",)
+
+
+def test_discovery_restricts_to_contact_about_team_links_only() -> None:
+    discovered = _discover_candidate_pages(
+        "https://example.com",
+        '<a href="/careers">Careers</a><a href="/menu">Menu</a>',
+        "example.com",
+    )
+
+    assert discovered == ()
+
+
+def test_robot_checker_uses_safe_transport_and_caches_per_origin() -> None:
+    transport = FakeTransport(
+        responses={
+            "https://example.com/robots.txt": TransportResponse(
+                final_url="https://example.com/robots.txt",
+                status_code=200,
+                headers={},
+                body=b"User-agent: *\nDisallow: /private\n",
+                peer_ip="93.184.216.34",
+            )
+        }
+    )
+    checker = _RobotFileRobotsChecker(transport=transport)
+
+    first = checker.allows("https://example.com/private")
+    second = checker.allows("https://example.com/about")
+
+    assert first == (False, None)
+    assert second == (True, None)
+    assert transport.requested_urls == ["https://example.com/robots.txt"]
+
+
+def test_robot_checker_returns_warning_when_transport_rejects_unsafe_redirect() -> None:
+    transport = FakeTransport(
+        responses={
+            "https://example.com/robots.txt": UnsafeUrlError("redirect changed registrable domain"),
+        }
+    )
+    checker = _RobotFileRobotsChecker(transport=transport)
+
+    allowed, warning = checker.allows("https://example.com/contact")
+
+    assert allowed is True
+    assert warning is not None
+    assert "redirect changed registrable domain" in warning

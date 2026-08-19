@@ -1,16 +1,18 @@
 from __future__ import annotations
 
+import http.client
 import ipaddress
 import re
 import socket
+import ssl
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from html.parser import HTMLParser
-from typing import Any, Protocol
+from typing import Protocol
 from urllib.parse import SplitResult, parse_qs, unquote, urljoin, urlsplit, urlunsplit
-from urllib.request import urlopen
+from urllib.robotparser import RobotFileParser
 
 from mapslead.errors import UnsafeUrlError
 from mapslead.models import EnrichmentResult, EnrichmentStatus
@@ -47,10 +49,15 @@ _DOWNLOAD_EXTENSIONS = frozenset(
     }
 )
 _AUTH_PATH_MARKERS = frozenset({"account", "login", "signin"})
+_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 
 
 class Resolver(Protocol):
     def resolve(self, hostname: str) -> tuple[str, ...]: ...
+
+
+class Requester(Protocol):
+    def fetch(self, request: TransportRequest) -> TransportResponse: ...
 
 
 class RobotsChecker(Protocol):
@@ -63,11 +70,46 @@ class FetchedPage:
     html: str
 
 
+@dataclass(frozen=True, slots=True)
+class ValidatedUrl:
+    normalized_url: str
+    scheme: str
+    hostname: str
+    port: int
+    target: str
+    registrable_domain: str | None
+    resolved_addresses: tuple[str, ...]
+    host_header: str
+
+
+@dataclass(frozen=True, slots=True)
+class TransportRequest:
+    url: str
+    scheme: str
+    hostname: str
+    port: int
+    target: str
+    host_header: str
+    ip_address: str
+
+
+@dataclass(frozen=True, slots=True)
+class TransportResponse:
+    final_url: str
+    status_code: int
+    headers: Mapping[str, str]
+    body: bytes
+    peer_ip: str
+
+
 class UrlPolicy:
     def __init__(self, resolver: Resolver | None = None) -> None:
         self._resolver = resolver or _SocketResolver()
 
     def validate(self, url: str, allowed_registrable_domain: str | None = None) -> str:
+        return self.inspect(url, allowed_registrable_domain=allowed_registrable_domain).normalized_url
+
+    def inspect(self, url: str, allowed_registrable_domain: str | None = None) -> ValidatedUrl:
         parsed = urlsplit(url.strip())
         if parsed.scheme not in {"http", "https"}:
             raise UnsafeUrlError(f"unsupported URL scheme: {url}")
@@ -79,24 +121,41 @@ class UrlPolicy:
 
         normalized_url = _rebuild_url(parsed)
         normalized_hostname = hostname.casefold().rstrip(".")
-        self._ensure_globally_routable(normalized_hostname)
+        resolved_addresses = self._ensure_globally_routable(normalized_hostname)
+        domain = registrable_domain(normalized_url)
 
-        if allowed_registrable_domain is not None:
-            candidate_domain = registrable_domain(normalized_url)
-            if candidate_domain != allowed_registrable_domain:
-                raise UnsafeUrlError(
-                    "redirect changed registrable domain: "
-                    f"{candidate_domain!r} != {allowed_registrable_domain!r}"
-                )
+        if allowed_registrable_domain is not None and domain != allowed_registrable_domain:
+            raise UnsafeUrlError(
+                "redirect changed registrable domain: "
+                f"{domain!r} != {allowed_registrable_domain!r}"
+            )
 
-        return normalized_url
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        host_header = normalized_hostname
+        if (parsed.scheme == "https" and port != 443) or (parsed.scheme == "http" and port != 80):
+            host_header = f"{host_header}:{port}"
 
-    def _ensure_globally_routable(self, hostname: str) -> None:
+        target = parsed.path or "/"
+        if parsed.query:
+            target = f"{target}?{parsed.query}"
+
+        return ValidatedUrl(
+            normalized_url=normalized_url,
+            scheme=parsed.scheme.casefold(),
+            hostname=normalized_hostname,
+            port=port,
+            target=target,
+            registrable_domain=domain,
+            resolved_addresses=resolved_addresses,
+            host_header=host_header,
+        )
+
+    def _ensure_globally_routable(self, hostname: str) -> tuple[str, ...]:
         literal_ip = _parse_ip(hostname)
         if literal_ip is not None:
             if not literal_ip.is_global:
                 raise UnsafeUrlError(f"hostname resolves to a non-global address: {hostname}")
-            return
+            return (literal_ip.compressed,)
 
         try:
             addresses = self._resolver.resolve(hostname)
@@ -106,18 +165,119 @@ class UrlPolicy:
         if not addresses:
             raise UnsafeUrlError(f"hostname did not resolve to any address: {hostname}")
 
+        normalized_addresses: list[str] = []
         for address in addresses:
             parsed = ipaddress.ip_address(address)
             if not parsed.is_global:
                 raise UnsafeUrlError(f"hostname resolves to a non-global address: {hostname}")
+            normalized_addresses.append(parsed.compressed)
+        return tuple(normalized_addresses)
+
+
+class SafeHttpTransport:
+    def __init__(
+        self,
+        *,
+        url_policy: UrlPolicy | None = None,
+        requester: Requester | None = None,
+        clock: Clock | None = None,
+        sleeper: Callable[[float], None] = time.sleep,
+        max_redirects: int = 5,
+    ) -> None:
+        self._url_policy = url_policy or UrlPolicy()
+        self._requester = requester or _SocketRequester()
+        self._clock = clock or _SystemClock()
+        self._sleeper = sleeper
+        self._max_redirects = max_redirects
+        self._last_request_by_domain: dict[str, float] = {}
+
+    def get(self, url: str, *, allowed_registrable_domain: str | None = None) -> TransportResponse:
+        current_url = url
+        for _ in range(self._max_redirects + 1):
+            validated = self._url_policy.inspect(
+                current_url,
+                allowed_registrable_domain=allowed_registrable_domain,
+            )
+            response = self._fetch_once(validated)
+            if response.status_code in _REDIRECT_STATUSES:
+                location = _header_value(response.headers, "Location")
+                if location is None:
+                    return TransportResponse(
+                        final_url=validated.normalized_url,
+                        status_code=response.status_code,
+                        headers=response.headers,
+                        body=response.body,
+                        peer_ip=response.peer_ip,
+                    )
+                current_url = urljoin(validated.normalized_url, location)
+                continue
+
+            return TransportResponse(
+                final_url=validated.normalized_url,
+                status_code=response.status_code,
+                headers=response.headers,
+                body=response.body,
+                peer_ip=response.peer_ip,
+            )
+
+        raise UnsafeUrlError(f"too many redirects while fetching {url}")
+
+    def _fetch_once(self, validated: ValidatedUrl) -> TransportResponse:
+        last_error: OSError | None = None
+        for ip_address in validated.resolved_addresses:
+            request = TransportRequest(
+                url=validated.normalized_url,
+                scheme=validated.scheme,
+                hostname=validated.hostname,
+                port=validated.port,
+                target=validated.target,
+                host_header=validated.host_header,
+                ip_address=ip_address,
+            )
+            self._wait_for_domain_slot(validated)
+            try:
+                response = self._requester.fetch(request)
+            except OSError as exc:
+                last_error = exc
+                continue
+            self._ensure_connected_peer(request, response)
+            return response
+        if last_error is not None:
+            raise last_error
+        raise OSError(f"no reachable public address for {validated.normalized_url}")
+
+    def _wait_for_domain_slot(self, validated: ValidatedUrl) -> None:
+        domain_key = validated.registrable_domain or validated.hostname
+        now = self._clock.monotonic()
+        last = self._last_request_by_domain.get(domain_key)
+        if last is not None:
+            elapsed = now - last
+            if elapsed < 2.0:
+                self._sleeper(2.0 - elapsed)
+        self._last_request_by_domain[domain_key] = self._clock.monotonic()
+
+    def _ensure_connected_peer(self, request: TransportRequest, response: TransportResponse) -> None:
+        expected = ipaddress.ip_address(request.ip_address)
+        actual = ipaddress.ip_address(response.peer_ip)
+        if actual != expected:
+            raise UnsafeUrlError(
+                "connected peer IP did not match validated resolution: "
+                f"{actual.compressed} != {expected.compressed}"
+            )
+        if not actual.is_global:
+            raise UnsafeUrlError(f"connected peer is not globally routable: {actual.compressed}")
 
 
 class ScraplingPageFetcher:
-    def fetch(self, url: str) -> FetchedPage:
-        from scrapling.fetchers import Fetcher
+    def __init__(self, transport: SafeHttpTransport | None = None) -> None:
+        self._transport = transport or SafeHttpTransport()
 
-        page = Fetcher.get(url)
-        return FetchedPage(final_url=str(page.url), html=str(page.html_content))
+    def fetch(self, url: str) -> FetchedPage:
+        response = self._transport.get(url)
+        return FetchedPage(
+            final_url=response.final_url,
+            html=_decode_body(response.body, response.headers),
+        )
 
 
 class WebsiteEnrichmentService:
@@ -132,10 +292,16 @@ class WebsiteEnrichmentService:
     ) -> None:
         self._page_fetcher = page_fetcher
         self._url_policy = url_policy or UrlPolicy()
-        self._robots_checker = robots_checker or _RobotFileRobotsChecker()
-        self._clock = clock or _SystemClock()
+        safe_clock = clock or _SystemClock()
+        self._robots_checker = robots_checker or _RobotFileRobotsChecker(
+            transport=SafeHttpTransport(
+                url_policy=self._url_policy,
+                clock=safe_clock,
+                sleeper=sleeper,
+            )
+        )
+        self._clock = safe_clock
         self._sleeper = sleeper
-        self._last_request_by_domain: dict[str, float] = {}
 
     def enrich(self, website: str) -> EnrichmentResult:
         warnings: list[str] = []
@@ -154,11 +320,7 @@ class WebsiteEnrichmentService:
                 return self._build_completed_result(emails, socials, warnings)
 
             _extract_contact_data(root_page.html, emails, socials)
-            for page_url in _discover_candidate_pages(
-                root_page.final_url,
-                root_page.html,
-                allowed_domain,
-            ):
+            for page_url in _discover_candidate_pages(root_page.final_url, root_page.html, allowed_domain):
                 page = self._fetch_page(page_url, allowed_domain, warnings)
                 if page is None:
                     continue
@@ -185,35 +347,23 @@ class WebsiteEnrichmentService:
         warnings: list[str],
     ) -> FetchedPage | None:
         validated_url = self._url_policy.validate(url, allowed_registrable_domain=allowed_domain)
-        allowed, warning = self._robots_checker.allows(validated_url)
-        if warning is not None and warning not in warnings:
-            warnings.append(warning)
-        if not allowed:
+        if not self._is_allowed_by_robots(validated_url, warnings):
             return None
 
-        self._wait_for_domain_slot(validated_url)
         page = self._page_fetcher.fetch(validated_url)
         final_url = self._url_policy.validate(
             page.final_url,
             allowed_registrable_domain=allowed_domain,
         )
+        if not self._is_allowed_by_robots(final_url, warnings):
+            return None
         return FetchedPage(final_url=final_url, html=page.html)
 
-    def _wait_for_domain_slot(self, url: str) -> None:
-        domain_key = registrable_domain(url)
-        if domain_key is None:
-            hostname = urlsplit(url).hostname
-            if hostname is None:
-                raise UnsafeUrlError(f"URL hostname is required: {url}")
-            domain_key = hostname.casefold().rstrip(".")
-
-        now = self._clock.monotonic()
-        last = self._last_request_by_domain.get(domain_key)
-        if last is not None:
-            elapsed = now - last
-            if elapsed < 2.0:
-                self._sleeper(2.0 - elapsed)
-        self._last_request_by_domain[domain_key] = self._clock.monotonic()
+    def _is_allowed_by_robots(self, url: str, warnings: list[str]) -> bool:
+        allowed, warning = self._robots_checker.allows(url)
+        if warning is not None and warning not in warnings:
+            warnings.append(warning)
+        return allowed
 
     def _build_completed_result(
         self,
@@ -272,33 +422,83 @@ class _SocketResolver:
         return tuple(sorted(addresses))
 
 
+class _SocketRequester:
+    def __init__(
+        self,
+        timeout_seconds: float = 10.0,
+        ssl_context_factory: Callable[[], ssl.SSLContext] | None = None,
+    ) -> None:
+        self._timeout_seconds = timeout_seconds
+        self._ssl_context_factory = ssl_context_factory or ssl.create_default_context
+
+    def fetch(self, request: TransportRequest) -> TransportResponse:
+        raw_socket = socket.create_connection(
+            (request.ip_address, request.port),
+            timeout=self._timeout_seconds,
+        )
+        connection: socket.socket | ssl.SSLSocket = raw_socket
+        try:
+            if request.scheme == "https":
+                context = self._ssl_context_factory()
+                connection = context.wrap_socket(raw_socket, server_hostname=request.hostname)
+
+            request_bytes = _build_http_request(request)
+            connection.sendall(request_bytes)
+
+            response = http.client.HTTPResponse(connection)
+            response.begin()
+            body = response.read()
+            peer_ip = connection.getpeername()[0]
+            headers = {key: value for key, value in response.getheaders()}
+            return TransportResponse(
+                final_url=request.url,
+                status_code=response.status,
+                headers=headers,
+                body=body,
+                peer_ip=str(peer_ip),
+            )
+        finally:
+            connection.close()
+
+
 class _RobotFileRobotsChecker:
-    def __init__(self, user_agent: str = "*") -> None:
+    def __init__(
+        self,
+        transport: SafeHttpTransport | None = None,
+        user_agent: str = "*",
+    ) -> None:
+        self._transport = transport or SafeHttpTransport()
         self._user_agent = user_agent
-        self._cache: dict[str, tuple[Any | None, str | None]] = {}
+        self._cache: dict[str, tuple[RobotFileParser | None, str | None]] = {}
 
     def allows(self, url: str) -> tuple[bool, str | None]:
         parsed = urlsplit(url)
         origin = urlunsplit((parsed.scheme, parsed.netloc, "", "", ""))
         parser, warning = self._cache.get(origin, (None, None))
         if origin not in self._cache:
-            parser, warning = self._load_parser(origin)
+            parser, warning = self._load_parser(origin, url)
             self._cache[origin] = (parser, warning)
         if parser is None:
             return True, warning
         return bool(parser.can_fetch(self._user_agent, url)), warning
 
-    def _load_parser(self, origin: str) -> tuple[Any | None, str | None]:
-        from urllib.robotparser import RobotFileParser
-
+    def _load_parser(self, origin: str, url: str) -> tuple[RobotFileParser | None, str | None]:
         robots_url = f"{origin}/robots.txt"
-        parser = RobotFileParser(robots_url)
+        allowed_domain = registrable_domain(url)
         try:
-            with urlopen(robots_url) as response:
-                body = response.read().decode("utf-8", errors="replace")
-        except OSError as exc:
-            warning = f"robots unavailable for {robots_url}: {exc}"
-            return None, warning
+            response = self._transport.get(
+                robots_url,
+                allowed_registrable_domain=allowed_domain,
+            )
+        except (OSError, UnsafeUrlError, ValueError) as exc:
+            return None, f"robots unavailable for {robots_url}: {exc}"
+
+        parser = RobotFileParser(robots_url)
+        if response.status_code >= 400:
+            parser.parse(())
+            return parser, None
+
+        body = _decode_body(response.body, response.headers)
         parser.parse(body.splitlines())
         return parser, None
 
@@ -385,6 +585,9 @@ def _discover_candidate_pages(
             continue
 
         priority = _link_priority(text, parsed.path)
+        if priority is None:
+            continue
+
         seen.add(candidate_url)
         scored.append(_ScoredLink(priority=priority, index=index, url=candidate_url))
 
@@ -497,7 +700,7 @@ def _is_filtered_path(path: str) -> bool:
     return not segments.isdisjoint(_AUTH_PATH_MARKERS)
 
 
-def _link_priority(text: str, path: str) -> int:
+def _link_priority(text: str, path: str) -> int | None:
     combined = f"{text} {path}".casefold()
     if "contact" in combined:
         return 0
@@ -505,7 +708,7 @@ def _link_priority(text: str, path: str) -> int:
         return 1
     if "team" in combined:
         return 2
-    return 3
+    return None
 
 
 def _combine_messages(messages: Sequence[str | None]) -> str | None:
@@ -537,3 +740,36 @@ def _rebuild_url(parsed: SplitResult) -> str:
         netloc = f"{normalized_hostname}:{port}"
     rebuilt = urlunsplit((parsed.scheme.casefold(), netloc, parsed.path or "", parsed.query, ""))
     return str(rebuilt)
+
+
+def _build_http_request(request: TransportRequest) -> bytes:
+    headers = [
+        f"GET {request.target} HTTP/1.1",
+        f"Host: {request.host_header}",
+        "User-Agent: mapslead/0.1",
+        "Accept: text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.1",
+        "Accept-Encoding: identity",
+        "Connection: close",
+        "",
+        "",
+    ]
+    return "\r\n".join(headers).encode("ascii")
+
+
+def _decode_body(body: bytes, headers: Mapping[str, str]) -> str:
+    content_type = _header_value(headers, "Content-Type") or ""
+    charset = "utf-8"
+    for part in content_type.split(";")[1:]:
+        key, _, value = part.partition("=")
+        if key.strip().casefold() == "charset" and value.strip():
+            charset = value.strip()
+            break
+    return body.decode(charset, errors="replace")
+
+
+def _header_value(headers: Mapping[str, str], name: str) -> str | None:
+    target = name.casefold()
+    for key, value in headers.items():
+        if key.casefold() == target:
+            return value
+    return None
