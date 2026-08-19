@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -7,8 +8,10 @@ from pathlib import Path
 
 import pytest
 
+from mapslead import provider as provider_module
+from mapslead.errors import ProviderSetupError
 from mapslead.models import ProviderCandidate, ProviderRequest
-from mapslead.provider import GosomDockerProvider, ProcessOutcome
+from mapslead.provider import GosomDockerProvider, ProcessOutcome, SubprocessRunner
 
 
 @dataclass
@@ -317,3 +320,107 @@ def test_replay_uses_attempt_order_without_running_docker_and_acquire_creates_ne
     assert acquire_result.status == "completed"
     assert len(acquire_runner.calls) == 1
     assert (provider_dir / "attempt-0011" / "queries.txt").exists()
+
+
+def test_subprocess_runner_translates_startup_oserror_to_provider_setup_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_popen(*args: object, **kwargs: object) -> object:
+        raise FileNotFoundError("docker not found")
+
+    monkeypatch.setattr(provider_module.subprocess, "Popen", fake_popen)
+
+    with pytest.raises(ProviderSetupError, match="docker not found"):
+        SubprocessRunner().run(["docker", "run"], tmp_path)
+
+
+def test_csv_parser_error_is_controlled_and_preserves_completed_rows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def write(results_path: Path) -> None:
+        results_path.parent.mkdir(parents=True, exist_ok=True)
+        results_path.write_text(
+            "title,place_id\n"
+            "Alpha Dental,ChIJ-alpha\n"
+            f"{'X' * 64},ChIJ-too-large\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(provider_module, "MAX_CSV_FIELD_SIZE", 16)
+
+    request = ProviderRequest(
+        business="dentists",
+        location="District 2",
+        provider_dir=tmp_path / "provider",
+        max_new_records=10,
+    )
+    acquire_runner = FakeRunner(writer=write)
+    acquire_provider = GosomDockerProvider(process_runner=acquire_runner)
+    acquired: list[ProviderCandidate] = []
+
+    acquire_result = acquire_provider.acquire(request, acquired.append)
+
+    assert acquire_result.status == "failed"
+    assert acquire_result.candidate_count == 1
+    assert acquire_result.rejected_row_count == 1
+    assert [candidate.place_id for candidate in acquired] == ["ChIJ-alpha"]
+    assert "field larger than field limit" in acquire_result.diagnostics_tail.lower()
+
+    replayed: list[ProviderCandidate] = []
+    replay_result = acquire_provider.replay(request, replayed.append)
+
+    assert replay_result.status == "failed"
+    assert replay_result.candidate_count == 1
+    assert replay_result.rejected_row_count == 1
+    assert [candidate.place_id for candidate in replayed] == ["ChIJ-alpha"]
+    assert "field larger than field limit" in replay_result.diagnostics_tail.lower()
+
+
+def test_subprocess_runner_captures_only_bounded_tails_incrementally(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeReadable:
+        def __init__(self, data: str) -> None:
+            self._buffer = io.StringIO(data)
+
+        def read(self, size: int = -1) -> str:
+            return self._buffer.read(size)
+
+        def close(self) -> None:
+            self._buffer.close()
+
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.stdout = FakeReadable(("out-" * 2_500) + "stdout-final")
+            self.stderr = FakeReadable(("err-" * 2_500) + "stderr-final")
+            self.returncode = 0
+
+        def communicate(
+            self,
+            input: str | None = None,
+            timeout: float | None = None,
+        ) -> tuple[str, str]:
+            raise AssertionError("communicate() should not be used for normal capture")
+
+        def wait(self, timeout: float | None = None) -> int:
+            return self.returncode
+
+        def terminate(self) -> None:
+            raise AssertionError("terminate() should not be called")
+
+        def kill(self) -> None:
+            raise AssertionError("kill() should not be called")
+
+    monkeypatch.setattr(provider_module.subprocess, "Popen", lambda *args, **kwargs: FakeProcess())
+
+    outcome = SubprocessRunner().run(["docker", "run"], tmp_path)
+
+    assert outcome.returncode == 0
+    assert outcome.interrupted is False
+    assert len(outcome.stdout_tail) == provider_module.DIAGNOSTIC_TAIL_LIMIT
+    assert len(outcome.stderr_tail) == provider_module.DIAGNOSTIC_TAIL_LIMIT
+    assert outcome.stdout_tail.endswith("stdout-final")
+    assert outcome.stderr_tail.endswith("stderr-final")

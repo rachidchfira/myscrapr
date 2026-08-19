@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import csv
 import subprocess
+import threading
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, Literal, Protocol, TypedDict
+from typing import IO, Final, Literal, Protocol, TextIO, TypedDict
 
 from pydantic import ValidationError
 
+from mapslead.errors import ProviderSetupError
 from mapslead.models import ProviderCandidate, ProviderRequest, ProviderResult
 from mapslead.ports import CandidateSink, MapsProvider
 
@@ -56,36 +58,67 @@ class ProcessRunner(Protocol):
     def run(self, args: list[str], cwd: Path) -> ProcessOutcome: ...
 
 
+class _TailBuffer:
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._value = ""
+
+    def append(self, chunk: str) -> None:
+        if not chunk:
+            return
+        combined = f"{self._value}{chunk}"
+        if len(combined) <= self._limit:
+            self._value = combined
+            return
+        self._value = combined[-self._limit :]
+
+    @property
+    def value(self) -> str:
+        return self._value
+
+
 class SubprocessRunner:
     def run(self, args: list[str], cwd: Path) -> ProcessOutcome:
-        process = subprocess.Popen(
-            args,
-            cwd=cwd,
-            shell=False,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
+        try:
+            process = subprocess.Popen(
+                args,
+                cwd=cwd,
+                shell=False,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        except OSError as error:
+            raise ProviderSetupError(f"Unable to start Docker provider: {error}") from error
+
+        stdout_buffer = _TailBuffer(DIAGNOSTIC_TAIL_LIMIT)
+        stderr_buffer = _TailBuffer(DIAGNOSTIC_TAIL_LIMIT)
+        readers = _start_reader_threads(process, stdout_buffer, stderr_buffer)
         interrupted = False
         try:
-            stdout, stderr = process.communicate()
+            process.wait()
             returncode = process.returncode if process.returncode is not None else 1
         except KeyboardInterrupt:
             interrupted = True
             with suppress(ProcessLookupError):
                 process.terminate()
             try:
-                stdout, stderr = process.communicate(timeout=5)
+                process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 with suppress(ProcessLookupError):
                     process.kill()
-                stdout, stderr = process.communicate()
+                process.wait()
             returncode = 130
+        finally:
+            for reader in readers:
+                reader.join()
+            _close_stream(process.stdout)
+            _close_stream(process.stderr)
 
         return ProcessOutcome(
             returncode=returncode,
-            stdout_tail=_tail_text(stdout),
-            stderr_tail=_tail_text(stderr),
+            stdout_tail=stdout_buffer.value,
+            stderr_tail=stderr_buffer.value,
             interrupted=interrupted,
         )
 
@@ -95,6 +128,7 @@ class _IngestResult:
     candidate_count: int
     rejected_row_count: int
     blocked: bool
+    parse_error: bool
     row_diagnostics: tuple[str, ...]
 
 
@@ -118,6 +152,7 @@ class GosomDockerProvider(MapsProvider):
         candidate_count = 0
         rejected_row_count = 0
         blocked = False
+        parse_error = False
         row_diagnostics: list[str] = []
 
         for results_path in _attempt_results_paths(request.provider_dir):
@@ -125,10 +160,11 @@ class GosomDockerProvider(MapsProvider):
             candidate_count += ingest_result.candidate_count
             rejected_row_count += ingest_result.rejected_row_count
             blocked = blocked or ingest_result.blocked
+            parse_error = parse_error or ingest_result.parse_error
             row_diagnostics.extend(ingest_result.row_diagnostics)
 
         return ProviderResult(
-            status="blocked" if blocked else "completed",
+            status="blocked" if blocked else "failed" if parse_error else "completed",
             candidate_count=candidate_count,
             rejected_row_count=rejected_row_count,
             diagnostics_tail=_compose_diagnostics("", "", row_diagnostics),
@@ -157,7 +193,7 @@ class GosomDockerProvider(MapsProvider):
             status = "partial"
         elif ingest_result.blocked or _diagnostics_indicate_blocked(diagnostics_tail):
             status = "blocked"
-        elif outcome.returncode != 0:
+        elif ingest_result.parse_error or outcome.returncode != 0:
             status = "failed"
 
         return ProviderResult(
@@ -167,10 +203,53 @@ class GosomDockerProvider(MapsProvider):
             diagnostics_tail=diagnostics_tail,
             interrupted=outcome.interrupted,
         )
+
+
 def _tail_text(value: str) -> str:
     if len(value) <= DIAGNOSTIC_TAIL_LIMIT:
         return value
     return value[-DIAGNOSTIC_TAIL_LIMIT:]
+
+
+def _start_reader_threads(
+    process: subprocess.Popen[str],
+    stdout_buffer: _TailBuffer,
+    stderr_buffer: _TailBuffer,
+) -> tuple[threading.Thread, ...]:
+    readers: list[threading.Thread] = []
+    if process.stdout is not None:
+        stdout_reader = threading.Thread(
+            target=_drain_stream,
+            args=(process.stdout, stdout_buffer),
+            daemon=True,
+        )
+        stdout_reader.start()
+        readers.append(stdout_reader)
+    if process.stderr is not None:
+        stderr_reader = threading.Thread(
+            target=_drain_stream,
+            args=(process.stderr, stderr_buffer),
+            daemon=True,
+        )
+        stderr_reader.start()
+        readers.append(stderr_reader)
+    return tuple(readers)
+
+
+def _drain_stream(stream: TextIO, buffer: _TailBuffer) -> None:
+    with suppress(OSError, ValueError):
+        while True:
+            chunk = stream.read(4096)
+            if chunk == "":
+                break
+            buffer.append(chunk)
+
+
+def _close_stream(stream: IO[str] | None) -> None:
+    if stream is None:
+        return
+    with suppress(OSError, ValueError):
+        stream.close()
 
 
 def _docker_args(queries_path: Path, out_dir: Path) -> list[str]:
@@ -237,57 +316,84 @@ def _ingest_results(results_path: Path, sink: CandidateSink) -> _IngestResult:
             candidate_count=0,
             rejected_row_count=0,
             blocked=False,
+            parse_error=False,
             row_diagnostics=(),
         )
 
+    previous_field_limit = csv.field_size_limit()
     csv.field_size_limit(MAX_CSV_FIELD_SIZE)
     candidate_count = 0
     rejected_row_count = 0
     blocked = False
+    parse_error = False
     row_diagnostics: list[str] = []
 
-    with results_path.open("r", encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        if reader.fieldnames is None:
-            return _IngestResult(
-                candidate_count=0,
-                rejected_row_count=0,
-                blocked=False,
-                row_diagnostics=(),
-            )
-
-        for line_number, row in enumerate(reader, start=2):
-            normalized_row = {
-                _canonicalize(key): value for key, value in row.items() if key is not None
-            }
-            if _row_is_empty(normalized_row):
-                continue
-
-            blocked_status = _first_value(normalized_row, CANONICAL_ALIASES["status"])
-            if blocked_status is not None and blocked_status.strip().lower() == "blocked":
-                blocked = True
-                row_diagnostics.append(f"row {line_number}: provider status blocked")
-                continue
-
+    try:
+        with results_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
             try:
-                candidate_data = _candidate_data_from_row(normalized_row)
-                candidate = ProviderCandidate(**candidate_data)
-            except (ValidationError, ValueError) as error:
+                fieldnames = reader.fieldnames
+            except csv.Error as error:
+                parse_error = True
                 rejected_row_count += 1
-                if isinstance(error, ValidationError):
-                    detail = error.errors()[0]["msg"]
-                else:
-                    detail = str(error)
-                row_diagnostics.append(f"row {line_number}: {detail}")
-                continue
+                row_diagnostics.append(_csv_error_diagnostic(reader.line_num or 1, error))
+                fieldnames = ()
+            if fieldnames is None:
+                return _IngestResult(
+                    candidate_count=0,
+                    rejected_row_count=0,
+                    blocked=False,
+                    parse_error=False,
+                    row_diagnostics=(),
+                )
+            if parse_error:
+                return _IngestResult(
+                    candidate_count=candidate_count,
+                    rejected_row_count=rejected_row_count,
+                    blocked=blocked,
+                    parse_error=True,
+                    row_diagnostics=tuple(row_diagnostics),
+                )
 
-            sink(candidate)
-            candidate_count += 1
+            for line_number, row in enumerate(reader, start=2):
+                normalized_row = {
+                    _canonicalize(key): value for key, value in row.items() if key is not None
+                }
+                if _row_is_empty(normalized_row):
+                    continue
+
+                blocked_status = _first_value(normalized_row, CANONICAL_ALIASES["status"])
+                if blocked_status is not None and blocked_status.strip().lower() == "blocked":
+                    blocked = True
+                    row_diagnostics.append(f"row {line_number}: provider status blocked")
+                    continue
+
+                try:
+                    candidate_data = _candidate_data_from_row(normalized_row)
+                    candidate = ProviderCandidate(**candidate_data)
+                except (ValidationError, ValueError) as error:
+                    rejected_row_count += 1
+                    if isinstance(error, ValidationError):
+                        detail = error.errors()[0]["msg"]
+                    else:
+                        detail = str(error)
+                    row_diagnostics.append(f"row {line_number}: {detail}")
+                    continue
+
+                sink(candidate)
+                candidate_count += 1
+    except csv.Error as error:
+        parse_error = True
+        rejected_row_count += 1
+        row_diagnostics.append(_csv_error_diagnostic(candidate_count + rejected_row_count + 1, error))
+    finally:
+        csv.field_size_limit(previous_field_limit)
 
     return _IngestResult(
         candidate_count=candidate_count,
         rejected_row_count=rejected_row_count,
         blocked=blocked,
+        parse_error=parse_error,
         row_diagnostics=tuple(row_diagnostics),
     )
 
@@ -366,3 +472,7 @@ def _compose_diagnostics(
 def _diagnostics_indicate_blocked(diagnostics_tail: str) -> bool:
     normalized = diagnostics_tail.lower()
     return any(signal in normalized for signal in BLOCKING_SIGNALS)
+
+
+def _csv_error_diagnostic(line_number: int, error: csv.Error) -> str:
+    return f"row {line_number}: csv parse error: {error}"
