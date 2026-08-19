@@ -49,6 +49,10 @@ class ExporterPort(Protocol):
     def export_run(self, run_id: str) -> ExportPaths: ...
 
 
+class CampaignExporterPort(Protocol):
+    def export_campaign(self, slug: str) -> ExportPaths: ...
+
+
 class ProgressSink(Protocol):
     def __call__(self, event: ProgressEvent) -> None: ...
 
