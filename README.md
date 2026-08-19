@@ -45,7 +45,7 @@ Before `scrape`, and before `resume` for an existing resumable run, MapsLead che
 - `Docker is unavailable. Install and start Docker, then retry.`
 - `Provider image is missing. Run: docker pull gosom/google-maps-scraper`
 
-`resume` validates run existence and status first. Missing, completed, and running runs fail immediately with an accurate no-traceback message and do not probe Docker.
+`resume` validates run existence and status first. Only partial, blocked, and failed runs are resumable; missing, completed, and running runs fail immediately with an accurate no-traceback message and do not probe Docker.
 
 Progress output stays concise:
 
