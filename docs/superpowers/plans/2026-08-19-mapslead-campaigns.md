@@ -31,13 +31,14 @@
 **Files:**
 - Modify: `src/mapslead/models.py`
 - Modify: `src/mapslead/errors.py`
+- Modify: `src/mapslead/normalize.py`
 - Modify: `src/mapslead/ports.py`
 - Modify: `src/mapslead/repository.py`
 - Create: `tests/test_campaign_repository.py`
 
 **Interfaces:**
 - Consumes: `normalize_text`, existing `RunRecord`, `RunSnapshot`, canonical business and quota transactions.
-- Produces: `CampaignRecord`, `CampaignSnapshot`, `CampaignStatus`, `EnrichmentCacheEntry`; extended `RunRecord`; repository campaign methods and schema version 2.
+- Produces: `CampaignRecord`, `CampaignSnapshot`, `CampaignStatus`, `EnrichmentCacheEntry`; `validate_campaign_slug`; extended `RunRecord`; repository campaign methods and schema version 2.
 
 - [ ] **Step 1: Write failing migration and campaign validation tests**
 
@@ -115,6 +116,8 @@ class CampaignStatus(FrozenModel):
 
 Extend `RunRecord` with `campaign_slug: str | None = None` and `refresh_enrichment: bool = False`. Add `CampaignError`, `InvalidCampaignError`, `CampaignNotFoundError`, `CampaignBusinessTypeError`, and `CampaignRunAssignmentError` under `MapsLeadError`.
 
+Add `validate_campaign_slug(slug: str) -> str` to `normalize.py`. It returns a valid slug unchanged and raises `InvalidCampaignError` otherwise. Repository creation and Task 3 path construction must call this shared validator so persistence and export cannot drift.
+
 - [ ] **Step 4: Implement schema version 2 and idempotent migration**
 
 Set `_SCHEMA_VERSION = 2`. New databases create the three campaign tables, `business_enrichment_cache`, and `runs.refresh_enrichment INTEGER NOT NULL DEFAULT 0`. Existing version-1 databases migrate inside one transaction with:
@@ -166,14 +169,14 @@ Run:
 
 ```bash
 .venv/bin/python -m pytest tests/test_campaign_repository.py tests/test_repository.py tests/test_models.py -q
-.venv/bin/python -m ruff check src/mapslead/models.py src/mapslead/errors.py src/mapslead/ports.py src/mapslead/repository.py tests/test_campaign_repository.py
+.venv/bin/python -m ruff check src/mapslead/models.py src/mapslead/errors.py src/mapslead/normalize.py src/mapslead/ports.py src/mapslead/repository.py tests/test_campaign_repository.py
 .venv/bin/python -m mypy src/mapslead
 ```
 
 Commit:
 
 ```bash
-git add src/mapslead/models.py src/mapslead/errors.py src/mapslead/ports.py src/mapslead/repository.py tests/test_campaign_repository.py
+git add src/mapslead/models.py src/mapslead/errors.py src/mapslead/normalize.py src/mapslead/ports.py src/mapslead/repository.py tests/test_campaign_repository.py
 git commit -m "feat: persist isolated campaign membership"
 ```
 
@@ -286,7 +289,7 @@ git commit -m "feat: reuse campaign website enrichment"
 - Modify: `src/mapslead/ports.py`
 
 **Interfaces:**
-- Consumes: Task 1 `CampaignSnapshot`, `RepositoryPort.campaign_snapshots`, `Settings.export_dir`.
+- Consumes: Task 1 `CampaignSnapshot`, `validate_campaign_slug`, `RepositoryPort.campaign_snapshots`, `Settings.export_dir`.
 - Produces: `CampaignExporter.export_campaign(slug: str) -> ExportPaths` and `CampaignExporterPort`.
 
 - [ ] **Step 1: Write failing golden export tests**
