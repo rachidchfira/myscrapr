@@ -1,1 +1,14 @@
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+.coverage
+coverage.xml
+build/
+dist/
+*.egg-info/
+data/
+exports/
+logs/
 .worktrees/
