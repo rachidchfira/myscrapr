@@ -369,11 +369,38 @@ def repository_remaining(settings: Settings, now: datetime) -> int:
     return reopened.remaining_quota(now)
 
 
-def test_initialize_creates_schema_version_one(settings: Settings) -> None:
+def test_initialize_creates_schema_version_two_with_campaign_tables(settings: Settings) -> None:
     repository = SQLiteRepository(settings)
     repository.initialize()
 
     with sqlite3.connect(settings.data_dir / "mapslead.sqlite3") as connection:
         version = connection.execute("SELECT version FROM schema_version").fetchone()
+        campaign_tables = {
+            row[0]
+            for row in connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name IN (
+                      'campaigns',
+                      'campaign_runs',
+                      'campaign_businesses',
+                      'business_enrichment_cache'
+                  )
+                """
+            ).fetchall()
+        }
+        runs_columns = {
+            str(row[1]): str(row[2])
+            for row in connection.execute("PRAGMA table_info(runs)").fetchall()
+        }
 
-    assert version == (1,)
+    assert version == (2,)
+    assert campaign_tables == {
+        "business_enrichment_cache",
+        "campaign_businesses",
+        "campaign_runs",
+        "campaigns",
+    }
+    assert runs_columns["refresh_enrichment"] == "INTEGER"
