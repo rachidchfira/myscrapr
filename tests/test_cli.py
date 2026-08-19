@@ -48,6 +48,7 @@ class FakeClock:
 @dataclass(slots=True)
 class FakeRepository:
     remaining_quota_value: int = DAILY_NEW_RECORD_LIMIT
+    remaining_quota_sequence: list[int] = field(default_factory=list)
     remaining_quota_calls: list[datetime] = field(default_factory=list)
     runs_by_id: dict[str, RunRecord] = field(default_factory=dict)
     campaigns_by_slug: dict[str, CampaignRecord] = field(default_factory=dict)
@@ -62,6 +63,8 @@ class FakeRepository:
 
     def remaining_quota(self, now: datetime) -> int:
         self.remaining_quota_calls.append(now)
+        if self.remaining_quota_sequence:
+            return self.remaining_quota_sequence.pop(0)
         return self.remaining_quota_value
 
     def get_run(self, run_id: str) -> RunRecord:
@@ -119,7 +122,9 @@ class FakeService:
     scrape_error: Exception | None = None
     resume_error: Exception | None = None
     scrape_call: tuple[str, str, int] | None = None
+    scrape_calls: list[tuple[str, str, int]] = field(default_factory=list)
     scrape_options: dict[str, Any] | None = None
+    scrape_option_calls: list[dict[str, Any]] = field(default_factory=list)
     resume_call: str | None = None
 
     def scrape(
@@ -131,13 +136,19 @@ class FakeService:
         progress: Callable[[ProgressEvent], None],
         *,
         campaign_slug: str | None = None,
+        query: str | None = None,
+        language: str = "en",
         refresh_enrichment: bool = False,
     ) -> RunOutcome:
         self.scrape_call = (business, location, limit)
+        self.scrape_calls.append((business, location, limit))
         self.scrape_options = {
             "campaign_slug": campaign_slug,
+            "query": query,
+            "language": language,
             "refresh_enrichment": refresh_enrichment,
         }
+        self.scrape_option_calls.append(self.scrape_options.copy())
         for event in self.progress_events:
             progress(event)
         if self.scrape_error is not None:
@@ -350,6 +361,88 @@ def test_scrape_command_uses_default_limit_when_not_provided(
     assert runtime.service.scrape_call == ("dentists", "HCMC", DEFAULT_RUN_LIMIT)
 
 
+def test_scrape_command_passes_default_query_and_language(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(tmp_path, service=FakeService(outcome=_outcome("run-123")))
+    _patch_runtime(monkeypatch, runtime)
+
+    result = runner.invoke(cli.app, ["scrape", "--business", "dentists", "--location", "HCMC"])
+
+    assert result.exit_code == 0
+    assert runtime.service.scrape_options == {
+        "campaign_slug": None,
+        "query": None,
+        "language": "en",
+        "refresh_enrichment": False,
+    }
+
+
+def test_scrape_command_batches_locations_and_queries_in_argument_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(tmp_path, service=FakeService(outcome=_outcome("run-123")))
+    _patch_runtime(monkeypatch, runtime)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "scrape",
+            "--business",
+            "dentists",
+            "--query",
+            "nha khoa",
+            "--query",
+            "phong kham nha khoa",
+            "--location",
+            "District 1, Ho Chi Minh City",
+            "--location",
+            "District 3, Ho Chi Minh City",
+            "--language",
+            "vi",
+            "--limit",
+            "25",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert runtime.service.scrape_calls == [
+        ("dentists", "District 1, Ho Chi Minh City", 25),
+        ("dentists", "District 1, Ho Chi Minh City", 25),
+        ("dentists", "District 3, Ho Chi Minh City", 25),
+        ("dentists", "District 3, Ho Chi Minh City", 25),
+    ]
+    assert runtime.service.scrape_option_calls == [
+        {
+            "campaign_slug": None,
+            "query": "nha khoa",
+            "language": "vi",
+            "refresh_enrichment": False,
+        },
+        {
+            "campaign_slug": None,
+            "query": "phong kham nha khoa",
+            "language": "vi",
+            "refresh_enrichment": False,
+        },
+        {
+            "campaign_slug": None,
+            "query": "nha khoa",
+            "language": "vi",
+            "refresh_enrichment": False,
+        },
+        {
+            "campaign_slug": None,
+            "query": "phong kham nha khoa",
+            "language": "vi",
+            "refresh_enrichment": False,
+        },
+    ]
+    assert "Batch summary: 4/4 runs completed." in result.stdout
+
+
 def test_scrape_campaign_uses_locked_business_type_before_prerequisites(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -383,6 +476,8 @@ def test_scrape_campaign_uses_locked_business_type_before_prerequisites(
     assert runtime.service.scrape_call == ("dentists", "Hanoi", 25)
     assert runtime.service.scrape_options == {
         "campaign_slug": "vietnam-dentists",
+        "query": None,
+        "language": "en",
         "refresh_enrichment": False,
     }
 
@@ -489,8 +584,153 @@ def test_scrape_campaign_passes_refresh_enrichment_flag(
     assert result.exit_code == 0
     assert runtime.service.scrape_options == {
         "campaign_slug": "vietnam-dentists",
+        "query": None,
+        "language": "en",
         "refresh_enrichment": True,
     }
+
+
+def test_scrape_campaign_uses_locked_business_type_with_query_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = FakeRepository(
+        campaigns_by_slug={
+            "vietnam-dentists": CampaignRecord(
+                slug="vietnam-dentists",
+                business_type="dentists",
+                created_at=FakeClock().now(),
+            )
+        }
+    )
+    runtime = _runtime(
+        tmp_path,
+        repository=repository,
+        service=FakeService(outcome=_outcome("run-123")),
+    )
+    _patch_runtime(monkeypatch, runtime)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "scrape",
+            "--campaign",
+            "vietnam-dentists",
+            "--query",
+            "phong kham nha khoa",
+            "--location",
+            "Ha Noi",
+            "--language",
+            "vi",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert runtime.service.scrape_call == ("dentists", "Ha Noi", DEFAULT_RUN_LIMIT)
+    assert runtime.service.scrape_options == {
+        "campaign_slug": "vietnam-dentists",
+        "query": "phong kham nha khoa",
+        "language": "vi",
+        "refresh_enrichment": False,
+    }
+
+
+def test_scrape_batch_clamps_limit_to_remaining_quota_and_stops_at_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checker = CountingChecker()
+    repository = FakeRepository(remaining_quota_sequence=[3, 0])
+    runtime = _runtime(
+        tmp_path,
+        repository=repository,
+        service=FakeService(outcome=_outcome("run-123")),
+    )
+    runtime.prerequisite_checker = checker
+    _patch_runtime(monkeypatch, runtime)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "scrape",
+            "--business",
+            "dentists",
+            "--location",
+            "Hanoi",
+            "--location",
+            "Da Nang",
+            "--limit",
+            "25",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert checker.calls == 1
+    assert runtime.service.scrape_calls == [("dentists", "Hanoi", 3)]
+    assert "Batch stopped: daily quota exhausted before pair 2/2." in result.stdout
+    assert "Batch summary: 1/2 runs completed." in result.stdout
+
+
+def test_scrape_batch_stops_after_resumable_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime(tmp_path, service=FakeService(outcome=_outcome("run-blocked", status=RunStatus.BLOCKED)))
+    _patch_runtime(monkeypatch, runtime)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "scrape",
+            "--business",
+            "dentists",
+            "--location",
+            "Hanoi",
+            "--location",
+            "Da Nang",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert runtime.service.scrape_calls == [("dentists", "Hanoi", DEFAULT_RUN_LIMIT)]
+    assert "Run blocked: run-blocked" in result.stdout
+    assert "Resume: mapslead resume run-blocked" in result.stdout
+    assert "Batch summary: 0/2 runs completed." in result.stdout
+
+
+def test_scrape_batch_rejects_invalid_language_before_prerequisites(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checker = CountingChecker()
+    repository = FakeRepository()
+    runtime = _runtime(
+        tmp_path,
+        repository=repository,
+        service=FakeService(outcome=_outcome("run-123")),
+    )
+    runtime.prerequisite_checker = checker
+    _patch_runtime(monkeypatch, runtime)
+
+    result = runner.invoke(
+        cli.app,
+        [
+            "scrape",
+            "--business",
+            "dentists",
+            "--query",
+            "nha khoa",
+            "--language",
+            "vi vn",
+            "--location",
+            "Hanoi",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "language must be a simple code like en or vi" in result.stdout
+    assert checker.calls == 0
+    assert repository.remaining_quota_calls == []
 
 
 def test_quota_command_reports_used_and_remaining(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -679,10 +919,12 @@ def test_scrape_reports_partial_and_blocked_runs_with_export_paths(
 
     result = runner.invoke(cli.app, ["scrape", "--business", "dentists", "--location", "HCMC"])
 
-    assert result.exit_code == 0
+    assert result.exit_code == 1
     assert expected_phrase in result.stdout
     assert "results.csv" in result.stdout
     assert "results.xlsx" in result.stdout
+    assert "Resume: mapslead resume run-123" in result.stdout
+    assert "Batch summary: 0/1 runs completed." in result.stdout
 
 
 def test_scrape_renders_progress_updates_and_final_exports(

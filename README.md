@@ -26,8 +26,7 @@ Global options:
 
 Main commands:
 
-- `mapslead scrape --business TEXT --location TEXT [--limit INTEGER]`
-- `mapslead scrape --campaign SLUG --location TEXT [--limit INTEGER] [--refresh-enrichment]`
+- `mapslead scrape (--business TEXT | --campaign SLUG) --location TEXT [--location TEXT ...] [--query TEXT ...] [--language CODE] [--limit INTEGER] [--refresh-enrichment]`
 - `mapslead quota`
 - `mapslead resume RUN_ID`
 - `mapslead export --run-id RUN_ID`
@@ -42,6 +41,7 @@ Main commands:
 .venv/bin/mapslead --data-dir ./data --export-dir ./exports scrape \
   --business "dentists" \
   --location "Ho Chi Minh City" \
+  --language en \
   --limit 25
 ```
 
@@ -70,7 +70,15 @@ Use this workflow for the Vietnam dentist campaign:
 ```bash
 .venv/bin/mapslead campaign create vietnam-dentists --business dentists
 .venv/bin/mapslead campaign attach-run vietnam-dentists 6f8d2ee1d37b44d7be6ce2413c0da825
-.venv/bin/mapslead scrape --campaign vietnam-dentists --location Hanoi --limit 300
+.venv/bin/mapslead scrape \
+  --campaign vietnam-dentists \
+  --query "nha khoa" \
+  --query "phong kham nha khoa" \
+  --location "Ha Noi" \
+  --location "Quan 1, Ho Chi Minh City" \
+  --location "Quan 3, Ho Chi Minh City" \
+  --language vi \
+  --limit 150
 .venv/bin/mapslead campaign status vietnam-dentists
 .venv/bin/mapslead campaign export vietnam-dentists
 ```
@@ -79,6 +87,8 @@ Rules that stay in force:
 
 - Campaigns are explicit. A run is either attached to one campaign or to none.
 - The daily `1000` new-unique quota stays global across campaign and non-campaign runs.
+- Repeating `--query` and `--location` runs the full location-by-query batch in the order you provided. Each pair becomes its own run, and `--limit` applies per pair.
+- MapsLead checks remaining daily quota before every pair, clamps a pair limit down when needed, and stops cleanly once quota reaches `0`.
 - Successful website enrichment is reused while the normalized website URL stays the same.
 - `--refresh-enrichment` forces website refetching for that run and stays persisted for resume.
 - Campaign master exports are written to `exports/campaigns/<slug>/results.csv`, `results.json`, and `results.xlsx`.

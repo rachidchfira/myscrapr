@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,6 +15,11 @@ from mapslead.config import DAILY_NEW_RECORD_LIMIT, DEFAULT_RUN_LIMIT, Settings
 from mapslead.enrichment import WebsiteEnrichmentService
 from mapslead.errors import MapsLeadError
 from mapslead.exporter import Exporter
+from mapslead.input_validation import (
+    validate_language_code,
+    validate_location_query,
+    validate_search_query,
+)
 from mapslead.models import CampaignStatus, ExportPaths, ProgressEvent, RunStatus
 from mapslead.provider import GosomDockerProvider
 from mapslead.repository import SQLiteRepository
@@ -52,12 +58,26 @@ EXPORT_DIR_OPTION = typer.Option(
 )
 BUSINESS_OPTION = typer.Option(..., "--business", help="Business type to search for.")
 CAMPAIGN_OPTION = typer.Option(None, "--campaign", help="Campaign slug to scrape into.")
-LOCATION_OPTION = typer.Option(..., "--location", help="Location query to search in.")
 LIMIT_OPTION = typer.Option(
     DEFAULT_RUN_LIMIT,
     "--limit",
     min=1,
     help="Maximum number of new unique records to accept for this run.",
+)
+QUERY_OPTION = typer.Option(
+    None,
+    "--query",
+    help="Search query alias to send to Google Maps. Repeat to batch multiple aliases.",
+)
+LOCATION_OPTION = typer.Option(
+    ...,
+    "--location",
+    help="Location query to search in. Repeat to batch multiple cities or districts.",
+)
+LANGUAGE_OPTION = typer.Option(
+    "en",
+    "--language",
+    help="Provider language code such as en or vi.",
 )
 EXPORT_RUN_ID_OPTION = typer.Option(..., "--run-id", help="Existing run identifier to export.")
 REFRESH_ENRICHMENT_OPTION = typer.Option(
@@ -88,6 +108,16 @@ class AppRuntime:
     campaign_exporter: Any
     clock: Any
     prerequisite_checker: Any
+
+
+@dataclass(frozen=True, slots=True)
+class ScrapePlanItem:
+    business: str
+    location: str
+    limit: int
+    query: str | None
+    language: str
+    campaign_slug: str | None
 
 
 class SystemClock:
@@ -156,7 +186,9 @@ def scrape(
     ctx: typer.Context,
     business: str | None = typer.Option(None, "--business", help="Business type to search for."),
     campaign: str | None = CAMPAIGN_OPTION,
-    location: str = LOCATION_OPTION,
+    query: list[str] | None = QUERY_OPTION,
+    location: list[str] = LOCATION_OPTION,
+    language: str = LANGUAGE_OPTION,
     limit: int = LIMIT_OPTION,
     refresh_enrichment: bool = REFRESH_ENRICHMENT_OPTION,
 ) -> None:
@@ -172,22 +204,72 @@ def scrape(
             _exit_with_message(_message_for_exception(exc), code=1)
 
     assert resolved_business is not None
-    _run_with_prerequisites(runtime.prerequisite_checker)
     try:
-        outcome = runtime.service.scrape(
-            resolved_business,
-            location,
-            limit,
-            runtime.clock.now(),
-            _progress_renderer(),
+        plan = _build_scrape_plan(
+            business=resolved_business,
             campaign_slug=campaign,
-            refresh_enrichment=refresh_enrichment,
+            queries=query,
+            locations=location,
+            language=language,
+            limit=limit,
         )
-    except RequestedLimitError as exc:
+    except ValueError as exc:
         _exit_with_message(_message_for_exception(exc), code=2)
-    except (MapsLeadError, KeyError) as exc:
-        _exit_with_message(_message_for_exception(exc), code=1)
-    _render_outcome(outcome)
+
+    completed_count = 0
+    launched_count = 0
+    prerequisites_checked = False
+    total_pairs = len(plan)
+    for index, item in enumerate(plan, start=1):
+        now = runtime.clock.now()
+        remaining = runtime.repository.remaining_quota(now)
+        if remaining <= 0:
+            typer.echo(f"Batch stopped: daily quota exhausted before pair {index}/{total_pairs}.")
+            _render_batch_summary(completed_count, total_pairs)
+            return
+
+        effective_limit = min(item.limit, remaining)
+        if not prerequisites_checked:
+            _run_with_prerequisites(runtime.prerequisite_checker)
+            prerequisites_checked = True
+        if effective_limit < item.limit:
+            typer.echo(
+                f"Pair {index}/{total_pairs}: clamped requested limit from {item.limit} to {effective_limit}."
+            )
+
+        try:
+            outcome = runtime.service.scrape(
+                item.business,
+                item.location,
+                effective_limit,
+                now,
+                _progress_renderer(),
+                campaign_slug=item.campaign_slug,
+                query=item.query,
+                language=item.language,
+                refresh_enrichment=refresh_enrichment,
+            )
+            launched_count += 1
+        except RequestedLimitError as exc:
+            typer.echo(f"Batch stopped at pair {index}/{total_pairs}: {_message_for_exception(exc)}")
+            _render_batch_summary(completed_count, total_pairs)
+            raise typer.Exit(code=2) from exc
+        except (MapsLeadError, KeyError) as exc:
+            typer.echo(f"Batch stopped at pair {index}/{total_pairs}: {_message_for_exception(exc)}")
+            _render_batch_summary(completed_count, total_pairs)
+            raise typer.Exit(code=1) from exc
+
+        outcome_exit_code = _render_outcome_with_exit_code(outcome)
+        if outcome.run.status is RunStatus.COMPLETED and outcome_exit_code == 0:
+            completed_count += 1
+        else:
+            if outcome.run.status in {RunStatus.PARTIAL, RunStatus.BLOCKED, RunStatus.FAILED}:
+                typer.echo(f"Resume: mapslead resume {outcome.run.id}")
+            _render_batch_summary(completed_count, total_pairs)
+            raise typer.Exit(code=outcome_exit_code or 1)
+
+    assert launched_count == total_pairs
+    _render_batch_summary(completed_count, total_pairs)
 
 
 @app.command()
@@ -337,15 +419,53 @@ def _progress_renderer() -> Any:
     return render
 
 
+def _build_scrape_plan(
+    *,
+    business: str,
+    campaign_slug: str | None,
+    queries: Sequence[str] | None,
+    locations: Sequence[str],
+    language: str,
+    limit: int,
+) -> list[ScrapePlanItem]:
+    validated_language = validate_language_code(language)
+    validated_locations = [validate_location_query(value) for value in locations]
+    validated_queries = [validate_search_query(value) for value in queries or ()]
+    resolved_queries = [None] if not validated_queries else validated_queries
+    return [
+        ScrapePlanItem(
+            business=business,
+            location=resolved_location,
+            limit=limit,
+            query=resolved_query,
+            language=validated_language,
+            campaign_slug=campaign_slug,
+        )
+        for resolved_location in validated_locations
+        for resolved_query in resolved_queries
+    ]
+
+
 def _render_outcome(outcome: Any) -> None:
+    outcome_exit_code = _render_outcome_with_exit_code(outcome)
+    if outcome_exit_code:
+        raise typer.Exit(code=1)
+
+
+def _render_outcome_with_exit_code(outcome: Any) -> int:
     typer.echo(f"Run {outcome.run.status.value}: {outcome.run.id}")
     if outcome.run.error:
         typer.echo(outcome.run.error)
     if outcome.service_error:
         typer.echo(outcome.service_error)
-        raise typer.Exit(code=1)
+        return 1
     if outcome.export_paths is not None:
         _render_export_paths(outcome.export_paths)
+    return 0
+
+
+def _render_batch_summary(completed_count: int, total_pairs: int) -> None:
+    typer.echo(f"Batch summary: {completed_count}/{total_pairs} runs completed.")
 
 
 def _render_export_paths(paths: ExportPaths) -> None:

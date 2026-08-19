@@ -199,3 +199,107 @@ def test_offline_national_campaign_flow_reuses_cache_and_exports_deduplicated_ro
     restaurant_paths = campaign_exporter.export_campaign(restaurants.slug)
     restaurant_payload = json.loads(restaurant_paths.json_path.read_text(encoding="utf-8"))
     assert [row["name"] for row in restaurant_payload] == ["Rice House"]
+
+
+def test_campaign_deduplicates_vietnamese_aliases_across_district_runs(
+    tmp_path: Path,
+) -> None:
+    settings = Settings(data_dir=tmp_path / "data", export_dir=tmp_path / "exports")
+    repository = SQLiteRepository(settings)
+    repository.initialize()
+    exporter = Exporter(repository, settings)
+    campaign_exporter = CampaignExporter(repository, settings)
+    now = datetime(2026, 8, 19, 11, 0, tzinfo=UTC)
+
+    campaign = repository.create_campaign("vietnam-dentists", "dentists", now)
+    provider = FakeProvider(
+        acquire_scripts=[
+            ProviderScript(
+                candidates=(
+                    ProviderCandidate(
+                        place_id="place-vi-1",
+                        name="Nha Khoa Viet Smile",
+                        category="Dentist",
+                        address="1 Nguyen Hue, Quan 1",
+                        phone="+84 28 111 222",
+                        website="https://vietsmile.example.com",
+                        google_maps_url="https://maps.google.com/?cid=place-vi-1",
+                    ),
+                ),
+                result=ProviderResult(
+                    status="completed",
+                    candidate_count=1,
+                    rejected_row_count=0,
+                    diagnostics_tail="done",
+                ),
+            ),
+            ProviderScript(
+                candidates=(
+                    ProviderCandidate(
+                        place_id="place-vi-1",
+                        name="Nha Khoa Viet Smile",
+                        category="Dental Clinic",
+                        address="1 Nguyen Hue, Quan 1",
+                        phone="+84 28 111 222",
+                        website="https://vietsmile.example.com",
+                        google_maps_url="https://maps.google.com/?cid=place-vi-1",
+                    ),
+                ),
+                result=ProviderResult(
+                    status="completed",
+                    candidate_count=1,
+                    rejected_row_count=0,
+                    diagnostics_tail="done",
+                ),
+            ),
+        ]
+    )
+    enricher = FakeEnricher(
+        responses={
+            "https://vietsmile.example.com": EnrichmentResult(
+                status=EnrichmentStatus.COMPLETED,
+                emails=("hello@vietsmile.example.com",),
+            )
+        }
+    )
+    service = MapsLeadService(repository, provider, enricher, exporter)
+
+    first = service.scrape(
+        "dentists",
+        "Quan 1, Ho Chi Minh City",
+        5,
+        now,
+        _progress_sink([]),
+        campaign_slug=campaign.slug,
+        query="nha khoa",
+        language="vi",
+    )
+    second = service.scrape(
+        "dentists",
+        "Quan 3, Ho Chi Minh City",
+        5,
+        now,
+        _progress_sink([]),
+        campaign_slug=campaign.slug,
+        query="phong kham nha khoa",
+        language="vi",
+    )
+
+    assert first.run.status is RunStatus.COMPLETED
+    assert second.run.status is RunStatus.COMPLETED
+    assert [request.search_query for request in provider.acquire_requests] == [
+        "nha khoa",
+        "phong kham nha khoa",
+    ]
+    assert [request.language for request in provider.acquire_requests] == ["vi", "vi"]
+    assert repository.remaining_quota(now) == DAILY_NEW_RECORD_LIMIT - 1
+
+    export_paths = campaign_exporter.export_campaign(campaign.slug)
+    payload = json.loads(export_paths.json_path.read_text(encoding="utf-8"))
+    assert len(payload) == 1
+    assert payload[0]["name"] == "Nha Khoa Viet Smile"
+    assert payload[0]["discovered_in"] == [
+        "Quan 1, Ho Chi Minh City",
+        "Quan 3, Ho Chi Minh City",
+    ]
+    assert payload[0]["emails"] == ["hello@vietsmile.example.com"]

@@ -11,6 +11,10 @@ def validate_search_query(query: str) -> str:
     return _validate_human_text(query, field_name="search query")
 
 
+def validate_location_query(location: str) -> str:
+    return _validate_human_text(location, field_name="location")
+
+
 def validate_language_code(language: str) -> str:
     normalized = _validate_human_text(language, field_name="language")
     if " " in normalized or _LANGUAGE_CODE_RE.fullmatch(normalized) is None:
