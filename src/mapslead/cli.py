@@ -13,20 +13,16 @@ from mapslead.config import DAILY_NEW_RECORD_LIMIT, DEFAULT_RUN_LIMIT, Settings
 from mapslead.enrichment import WebsiteEnrichmentService
 from mapslead.errors import MapsLeadError
 from mapslead.exporter import Exporter
-from mapslead.models import ExportPaths, ProgressEvent
+from mapslead.models import ExportPaths, ProgressEvent, RunStatus
 from mapslead.provider import GosomDockerProvider
 from mapslead.repository import SQLiteRepository
-from mapslead.service import MapsLeadService, RequestedLimitError
+from mapslead.service import MapsLeadService, RequestedLimitError, ResumeNotAllowedError
 
 PROVIDER_IMAGE = "gosom/google-maps-scraper"
 DOCKER_UNAVAILABLE_MESSAGE = "Docker is unavailable. Install and start Docker, then retry."
 PROVIDER_IMAGE_MISSING_MESSAGE = (
     f"Provider image is missing. Run: docker pull {PROVIDER_IMAGE}"
 )
-SCRAPLING_UNAVAILABLE_MESSAGE = (
-    "Scrapling is unavailable. Reinstall MapsLead with: pip install -e ."
-)
-CHROMIUM_UNAVAILABLE_MESSAGE = "Chromium is missing. Run: playwright install chromium"
 
 app = typer.Typer(
     add_completion=False,
@@ -97,14 +93,8 @@ class OperatorPrerequisiteChecker:
         self,
         *,
         run_command: Any = None,
-        import_scrapling_fetcher: Any = None,
-        chromium_executable_path: Any = None,
-        path_exists: Any = None,
     ) -> None:
         self._run_command = run_command or _run_command
-        self._import_scrapling_fetcher = import_scrapling_fetcher or _import_scrapling_fetcher
-        self._chromium_executable_path = chromium_executable_path or _chromium_executable_path
-        self._path_exists = path_exists or (lambda path: path.exists())
 
     def check(self) -> None:
         try:
@@ -118,18 +108,6 @@ class OperatorPrerequisiteChecker:
         image_check = self._run_command(["docker", "image", "inspect", PROVIDER_IMAGE])
         if image_check.returncode != 0:
             raise PrerequisiteError(PROVIDER_IMAGE_MISSING_MESSAGE)
-
-        try:
-            self._import_scrapling_fetcher()
-        except ImportError as exc:
-            raise PrerequisiteError(SCRAPLING_UNAVAILABLE_MESSAGE) from exc
-
-        try:
-            chromium_path = self._chromium_executable_path()
-        except Exception as exc:
-            raise PrerequisiteError(CHROMIUM_UNAVAILABLE_MESSAGE) from exc
-        if not self._path_exists(chromium_path):
-            raise PrerequisiteError(CHROMIUM_UNAVAILABLE_MESSAGE)
 
 
 def build_service(settings: Settings) -> AppRuntime:
@@ -198,8 +176,9 @@ def quota(ctx: typer.Context) -> None:
 @app.command()
 def resume(ctx: typer.Context, run_id: str) -> None:
     runtime = _runtime_for_context(ctx)
-    _run_with_prerequisites(runtime.prerequisite_checker)
     try:
+        _ensure_resumable_run(runtime.repository, run_id)
+        _run_with_prerequisites(runtime.prerequisite_checker)
         outcome = runtime.service.resume(run_id, runtime.clock.now(), _progress_renderer())
     except (MapsLeadError, KeyError) as exc:
         _exit_with_message(_message_for_exception(exc), code=1)
@@ -255,17 +234,10 @@ def _run_command(args: list[str]) -> CommandResult:
     return CommandResult(args=args, returncode=completed.returncode)
 
 
-def _import_scrapling_fetcher() -> Any:
-    from scrapling.fetchers import Fetcher
-
-    return Fetcher
-
-
-def _chromium_executable_path() -> Path:
-    from playwright.sync_api import sync_playwright
-
-    with sync_playwright() as playwright:
-        return Path(playwright.chromium.executable_path)
+def _ensure_resumable_run(repository: Any, run_id: str) -> None:
+    run = repository.get_run(run_id)
+    if run.status not in {RunStatus.PARTIAL, RunStatus.BLOCKED, RunStatus.FAILED}:
+        raise ResumeNotAllowedError(f"run {run_id} cannot be resumed from status {run.status.value}")
 
 
 def _progress_renderer() -> Any:

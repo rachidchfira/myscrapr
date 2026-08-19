@@ -6,16 +6,14 @@ MapsLead is a local CLI for collecting Google Maps lead candidates, enriching bu
 
 - Python 3.12
 - Docker Desktop or another local Docker runtime
-- Chromium installed for Playwright
 
 ## Install
 
-Create a virtual environment, install the project in editable mode with dev tools, and install Chromium:
+Create a virtual environment, install the project in editable mode with dev tools, and pull the provider image:
 
 ```bash
 python3.12 -m venv .venv
 .venv/bin/pip install -e '.[dev]'
-.venv/bin/playwright install chromium
 docker pull gosom/google-maps-scraper
 ```
 
@@ -42,12 +40,12 @@ Main commands:
   --limit 25
 ```
 
-Before `scrape` or `resume`, MapsLead checks the local operator prerequisites and prints these exact remediations when needed:
+Before `scrape`, and before `resume` for an existing resumable run, MapsLead checks the actual acquisition prerequisites and prints these exact remediations when needed:
 
 - `Docker is unavailable. Install and start Docker, then retry.`
 - `Provider image is missing. Run: docker pull gosom/google-maps-scraper`
-- `Scrapling is unavailable. Reinstall MapsLead with: pip install -e .`
-- `Chromium is missing. Run: playwright install chromium`
+
+`resume` validates run existence and status first. Missing, completed, and running runs fail immediately with an accurate no-traceback message and do not probe Docker.
 
 Progress output stays concise:
 
@@ -108,11 +106,10 @@ These commands were verified in this repository on August 19, 2026:
 This is the manual smoke path for a real networked run. Keep it capped at five requested results:
 
 1. Ensure Docker is running and the provider image is present: `docker pull gosom/google-maps-scraper`
-2. Ensure Chromium is installed: `.venv/bin/playwright install chromium`
-3. Start a small run: `.venv/bin/mapslead --data-dir ./smoke-data --export-dir ./smoke-exports scrape --business "dentists" --location "Ho Chi Minh City" --limit 5`
-4. Confirm the CLI prints a run ID plus `results.csv` and `results.json` paths.
-5. Inspect `./smoke-exports/<run-id>/results.csv` and `./smoke-exports/<run-id>/results.json`.
-6. Re-run `.venv/bin/mapslead --data-dir ./smoke-data --export-dir ./smoke-exports quota` and confirm `Used today: 5`.
+2. Start a small run: `.venv/bin/mapslead --data-dir ./smoke-data --export-dir ./smoke-exports scrape --business "dentists" --location "Ho Chi Minh City" --limit 5`
+3. Confirm the CLI prints a run ID plus `results.csv` and `results.json` paths.
+4. Inspect `./smoke-exports/<run-id>/results.csv` and `./smoke-exports/<run-id>/results.json`.
+5. Re-run `.venv/bin/mapslead --data-dir ./smoke-data --export-dir ./smoke-exports quota` and confirm `Used today: 5`.
 
 ## Test Commands
 

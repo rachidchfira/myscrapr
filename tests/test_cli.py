@@ -46,6 +46,7 @@ class FakeClock:
 class FakeRepository:
     remaining_quota_value: int = DAILY_NEW_RECORD_LIMIT
     remaining_quota_calls: list[datetime] = field(default_factory=list)
+    runs_by_id: dict[str, RunRecord] = field(default_factory=dict)
 
     def initialize(self) -> None:
         return None
@@ -55,7 +56,9 @@ class FakeRepository:
         return self.remaining_quota_value
 
     def get_run(self, run_id: str) -> RunRecord:
-        return _run_record(run_id)
+        if run_id not in self.runs_by_id:
+            raise KeyError(f"run {run_id} not found")
+        return self.runs_by_id[run_id]
 
 
 @dataclass(slots=True)
@@ -109,6 +112,17 @@ class FakeRuntime:
     exporter: Any
     clock: FakeClock
     prerequisite_checker: Callable[[], None] = lambda: None
+
+
+@dataclass(slots=True)
+class CountingChecker:
+    calls: int = 0
+    error: Exception | None = None
+
+    def __call__(self) -> None:
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
 
 
 class TrackingRepository(SQLiteRepository):
@@ -213,7 +227,7 @@ def _outcome(run_id: str, status: RunStatus = RunStatus.COMPLETED) -> RunOutcome
 
 def _runtime(tmp_path: Path, *, service: Any, repository: Any | None = None, exporter: Any | None = None) -> FakeRuntime:
     settings = Settings(data_dir=tmp_path / "data", export_dir=tmp_path / "exports")
-    active_repository = repository or FakeRepository()
+    active_repository = repository or FakeRepository(runs_by_id={"run-123": _run_record("run-123")})
     active_exporter = exporter or FakeExporter(_export_paths("run-123"))
     return FakeRuntime(
         settings=settings,
@@ -282,7 +296,12 @@ def test_resume_command_uses_run_id_and_reports_exports(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runtime = _runtime(tmp_path, service=FakeService(outcome=_outcome("run-456")))
+    repository = FakeRepository(runs_by_id={"run-456": _run_record("run-456", status=RunStatus.PARTIAL)})
+    runtime = _runtime(
+        tmp_path,
+        repository=repository,
+        service=FakeService(outcome=_outcome("run-456")),
+    )
     _patch_runtime(monkeypatch, runtime)
 
     result = runner.invoke(cli.app, ["resume", "run-456"])
@@ -294,8 +313,10 @@ def test_resume_command_uses_run_id_and_reports_exports(
 
 def test_export_command_regenerates_exports(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     exporter = FakeExporter(_export_paths("run-789"))
+    repository = FakeRepository(runs_by_id={"run-789": _run_record("run-789")})
     runtime = _runtime(
         tmp_path,
+        repository=repository,
         service=FakeService(outcome=_outcome("run-123")),
         exporter=exporter,
     )
@@ -495,9 +516,6 @@ def test_scrape_reports_prerequisite_guidance_without_creating_a_run(
 def test_prerequisite_checker_reports_docker_unavailable() -> None:
     checker = cli.OperatorPrerequisiteChecker(
         run_command=_missing_docker,
-        import_scrapling_fetcher=lambda: object(),
-        chromium_executable_path=lambda: Path("/tmp/chromium"),
-        path_exists=lambda _path: True,
     )
 
     with pytest.raises(cli.PrerequisiteError, match="Docker is unavailable"):
@@ -507,37 +525,77 @@ def test_prerequisite_checker_reports_docker_unavailable() -> None:
 def test_prerequisite_checker_reports_missing_provider_image() -> None:
     checker = cli.OperatorPrerequisiteChecker(
         run_command=_missing_provider_image,
-        import_scrapling_fetcher=lambda: object(),
-        chromium_executable_path=lambda: Path("/tmp/chromium"),
-        path_exists=lambda _path: True,
     )
 
     with pytest.raises(cli.PrerequisiteError, match="docker pull gosom/google-maps-scraper"):
         checker.check()
 
+def test_prerequisite_checker_only_requires_docker_and_provider_image() -> None:
+    checker = cli.OperatorPrerequisiteChecker(run_command=_docker_ok)
 
-def test_prerequisite_checker_reports_scrapling_import_failure() -> None:
-    checker = cli.OperatorPrerequisiteChecker(
-        run_command=_docker_ok,
-        import_scrapling_fetcher=_missing_scrapling,
-        chromium_executable_path=lambda: Path("/tmp/chromium"),
-        path_exists=lambda _path: True,
-    )
-
-    with pytest.raises(cli.PrerequisiteError, match="pip install -e ."):
-        checker.check()
+    checker.check()
 
 
-def test_prerequisite_checker_reports_missing_chromium() -> None:
-    checker = cli.OperatorPrerequisiteChecker(
-        run_command=_docker_ok,
-        import_scrapling_fetcher=lambda: object(),
-        chromium_executable_path=lambda: Path("/tmp/chromium"),
-        path_exists=lambda _path: False,
-    )
+def test_resume_missing_run_reports_accurate_error_before_prerequisite_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checker = CountingChecker()
+    repository = FakeRepository(runs_by_id={})
+    service = FakeService(outcome=_outcome("run-123"))
+    runtime = _runtime(tmp_path, repository=repository, service=service)
+    runtime.prerequisite_checker = checker
+    _patch_runtime(monkeypatch, runtime)
 
-    with pytest.raises(cli.PrerequisiteError, match="playwright install chromium"):
-        checker.check()
+    result = runner.invoke(cli.app, ["resume", "missing-run"])
+
+    assert result.exit_code == 1
+    assert "run missing-run not found" in result.stdout
+    assert "Traceback" not in result.stdout
+    assert checker.calls == 0
+    assert service.resume_call is None
+
+
+@pytest.mark.parametrize("status", [RunStatus.COMPLETED, RunStatus.RUNNING])
+def test_resume_non_resumable_status_reports_before_prerequisite_checks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: RunStatus,
+) -> None:
+    checker = CountingChecker()
+    run_id = f"run-{status.value}"
+    repository = FakeRepository(runs_by_id={run_id: _run_record(run_id, status=status)})
+    service = FakeService(outcome=_outcome("run-123"))
+    runtime = _runtime(tmp_path, repository=repository, service=service)
+    runtime.prerequisite_checker = checker
+    _patch_runtime(monkeypatch, runtime)
+
+    result = runner.invoke(cli.app, ["resume", run_id])
+
+    assert result.exit_code == 1
+    assert f"run {run_id} cannot be resumed from status {status.value}" in result.stdout
+    assert "Traceback" not in result.stdout
+    assert checker.calls == 0
+    assert service.resume_call is None
+
+
+def test_resume_resumable_run_checks_prerequisites_before_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    checker = CountingChecker()
+    run_id = "run-partial"
+    repository = FakeRepository(runs_by_id={run_id: _run_record(run_id, status=RunStatus.PARTIAL)})
+    service = FakeService(outcome=_outcome(run_id, status=RunStatus.PARTIAL))
+    runtime = _runtime(tmp_path, repository=repository, service=service)
+    runtime.prerequisite_checker = checker
+    _patch_runtime(monkeypatch, runtime)
+
+    result = runner.invoke(cli.app, ["resume", run_id])
+
+    assert result.exit_code == 0
+    assert checker.calls == 1
+    assert service.resume_call == run_id
 
 
 def test_offline_end_to_end_scrape_quota_and_reexport_are_stable(
@@ -729,7 +787,3 @@ def _missing_provider_image(args: list[str]) -> cli.CommandResult:
     if args[:2] == ["docker", "version"]:
         return cli.CommandResult(args=args, returncode=0)
     return cli.CommandResult(args=args, returncode=1)
-
-
-def _missing_scrapling() -> object:
-    raise ImportError("scrapling")

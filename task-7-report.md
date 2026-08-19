@@ -96,3 +96,57 @@ Prioritized follow-up:
 1. Run the documented five-record live smoke on the target workstation.
 2. Capture one real blocked/partial provider run and verify the `resume` operator path with Docker present.
 3. If operators need finer diagnostics later, split Playwright import/bootstrap failures from missing-browser failures without changing the current command contract.
+
+## Review Fix Round 1
+
+Date: August 19, 2026
+
+### Issue Addressed
+
+Important 1:
+
+- The CLI was blocking `scrape` and `resume` on Scrapling import and Playwright Chromium checks even though the current safe enrichment runtime uses direct HTTP and does not require those operator prerequisites.
+
+Important 2:
+
+- `resume` was probing Docker before confirming that the run existed and was in a resumable state, which could hide the real operator error and do unnecessary prerequisite work.
+
+### Smallest Safe Correction
+
+- Reduced `OperatorPrerequisiteChecker` to the actual acquisition prerequisites only:
+  - `docker version`
+  - `docker image inspect gosom/google-maps-scraper`
+- Added CLI-side resumability preflight using repository state before any Docker/image checks.
+- Kept the existing service-level resume validation in place so the CLI preflight is additive safety, not the only enforcement layer.
+- Updated README wording and smoke instructions to remove the false Chromium/browser requirement.
+
+### RED To GREEN
+
+Added and ran failing CLI tests first for:
+
+- missing run on `resume` must error before any prerequisite checks
+- completed run on `resume` must error before any prerequisite checks
+- running run on `resume` must error before any prerequisite checks
+- resumable run still performs prerequisite checks before calling `service.resume`
+- prerequisite checker no longer depends on Scrapling or Chromium
+
+Initial RED result:
+
+- `tests/test_cli.py` failed because `resume` checked prerequisites too early and the tests still reflected the removed browser gates.
+
+GREEN result:
+
+- `.venv/bin/python -m pytest tests/test_cli.py -q`
+  - Result: `20 passed`
+
+### Verification
+
+- `.venv/bin/python -m pytest -q`
+- `.venv/bin/python -m ruff check .`
+- `.venv/bin/python -m mypy src/mapslead`
+- `.venv/bin/python -m build`
+
+### Compatibility Note
+
+- I did not edit `pyproject.toml` because it is outside the owned file set for this task round.
+- Follow-up for parent: re-evaluate whether `scrapling` and any Playwright/browser-related runtime dependency expectations should remain in project metadata now that operator-time enrichment uses the direct HTTP transport path.
