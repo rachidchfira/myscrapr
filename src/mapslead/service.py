@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 
-from mapslead.errors import ExportError, MapsLeadError, RunStateError
+from mapslead.errors import ExportError, MapsLeadError, QuotaExceededError, RunStateError
 from mapslead.models import (
     EnrichmentResult,
     EnrichmentStatus,
@@ -41,6 +41,7 @@ class _AcquisitionState:
     known_identity_keys: set[str]
     candidate_count: int
     new_unique_count: int
+    quota_exhausted: bool = False
 
 
 class MapsLeadService:
@@ -89,8 +90,10 @@ class MapsLeadService:
 
     def resume(self, run_id: str, now: datetime, progress: ProgressSink) -> RunOutcome:
         run = self._repository.get_run(run_id)
-        if run.status is RunStatus.COMPLETED:
-            raise ResumeNotAllowedError(f"run {run_id} is already completed")
+        if run.status not in {RunStatus.PARTIAL, RunStatus.BLOCKED, RunStatus.FAILED}:
+            raise ResumeNotAllowedError(
+                f"run {run_id} cannot be resumed from status {run.status.value}"
+            )
 
         acquisition_state = self._acquisition_state_for_run(run.id)
         replay_request = ProviderRequest(
@@ -240,6 +243,8 @@ class MapsLeadService:
     def _final_status(self, provider_result: ProviderResult) -> RunStatus:
         if provider_result.interrupted:
             return RunStatus.PARTIAL
+        if provider_result.status == RunStatus.PARTIAL.value:
+            return RunStatus.PARTIAL
         if provider_result.status == RunStatus.BLOCKED.value:
             return RunStatus.BLOCKED
         if provider_result.status == RunStatus.FAILED.value:
@@ -287,12 +292,21 @@ class _RepositoryCandidateSink:
 
     def __call__(self, candidate: ProviderCandidate) -> None:
         candidate_keys = _identity_keys_for_candidate(candidate)
+        is_known_duplicate = bool(candidate_keys & self.state.known_identity_keys)
+        if self.state.quota_exhausted and not is_known_duplicate:
+            return
         if self.state.new_unique_count >= self.max_new_unique and not (
             candidate_keys & self.state.known_identity_keys
         ):
             return
 
-        acceptance = self.repository.accept_candidate(self.run_id, candidate, self.now)
+        try:
+            acceptance = self.repository.accept_candidate(self.run_id, candidate, self.now)
+        except QuotaExceededError:
+            if is_known_duplicate:
+                raise
+            self.state.quota_exhausted = True
+            return
         self.state.candidate_count += 1
         if acceptance.is_new:
             self.state.new_unique_count += 1

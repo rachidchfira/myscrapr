@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 from mapslead.config import DAILY_NEW_RECORD_LIMIT, DEFAULT_RUN_LIMIT, Settings
-from mapslead.errors import ExportError
+from mapslead.errors import ExportError, QuotaExceededError
 from mapslead.exporter import Exporter
 from mapslead.models import (
     EnrichmentResult,
@@ -82,6 +82,24 @@ class FakeEnricher:
         if isinstance(response, Exception):
             raise response
         return response
+
+
+@dataclass(slots=True)
+class QuotaRaceRepository:
+    inner: SQLiteRepository
+    race_place_ids: set[str]
+    raced_place_ids: set[str] = field(default_factory=set)
+    delegated_place_ids: list[str | None] = field(default_factory=list)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+    def accept_candidate(self, run_id: str, candidate: ProviderCandidate, now: datetime) -> Any:
+        if candidate.place_id in self.race_place_ids and candidate.place_id not in self.raced_place_ids:
+            self.raced_place_ids.add(candidate.place_id)
+            raise QuotaExceededError("daily quota exhausted during concurrent acceptance")
+        self.delegated_place_ids.append(candidate.place_id)
+        return self.inner.accept_candidate(run_id, candidate, now)
 
 
 def _progress_sink(events: list[ProgressEvent]) -> Any:
@@ -265,6 +283,45 @@ def test_scrape_reuses_existing_business_and_enriches_current_run_without_checkp
     assert enricher.calls == ["https://reused.example.com"]
 
 
+def test_scrape_quota_race_stops_new_uniques_but_finishes_and_exports_known_duplicates(
+    repository: SQLiteRepository,
+    exporter: Exporter,
+    now: datetime,
+) -> None:
+    race_repository = QuotaRaceRepository(repository, race_place_ids={"place-2"})
+    first = candidate_for(1, website="https://accepted.example.com")
+    raced = candidate_for(2, website="https://raced.example.com")
+    skipped = candidate_for(3, website="https://skipped.example.com")
+    provider = FakeProvider(
+        acquire_scripts=[
+            ProviderScript(
+                candidates=(first, raced, skipped, first),
+                result=ProviderResult(
+                    status="completed",
+                    candidate_count=4,
+                    rejected_row_count=0,
+                    diagnostics_tail="provider completed",
+                ),
+            )
+        ]
+    )
+    service = MapsLeadService(race_repository, provider, FakeEnricher(), exporter)
+    progress_events: list[ProgressEvent] = []
+
+    outcome = service.scrape("dentists", "HCMC", 5, now, _progress_sink(progress_events))
+
+    assert outcome.run.status is RunStatus.COMPLETED
+    assert outcome.run.error is None
+    assert outcome.service_error is None
+    assert outcome.export_paths is not None
+    assert race_repository.delegated_place_ids == ["place-1", "place-1"]
+    assert repository.get_run(outcome.run.id).status is RunStatus.COMPLETED
+    assert repository.new_unique_count_for_run(outcome.run.id) == 1
+    assert len(repository.snapshots_for_run(outcome.run.id)) == 1
+    assert len(load_export_json(outcome)) == 1
+    assert [event.kind for event in progress_events] == ["acquisition", "acquisition", "enrichment", "export"]
+
+
 def test_scrape_persists_individual_enrichment_errors_without_failing_run(
     repository: SQLiteRepository,
     exporter: Exporter,
@@ -365,6 +422,34 @@ def test_scrape_marks_keyboard_interruptions_partial_and_exports_records(
     assert len(load_export_json(outcome)) == 1
 
 
+def test_scrape_honors_partial_provider_status_without_interrupted_flag(
+    repository: SQLiteRepository,
+    exporter: Exporter,
+    now: datetime,
+) -> None:
+    provider = FakeProvider(
+        acquire_scripts=[
+            ProviderScript(
+                candidates=(candidate_for(1, website="https://partial-status.example.com"),),
+                result=ProviderResult(
+                    status="partial",
+                    candidate_count=1,
+                    rejected_row_count=0,
+                    diagnostics_tail="provider reported partial completion",
+                    interrupted=False,
+                ),
+            )
+        ]
+    )
+    service = MapsLeadService(repository, provider, FakeEnricher(), exporter)
+
+    outcome = service.scrape("dentists", "HCMC", 5, now, _progress_sink([]))
+
+    assert outcome.run.status is RunStatus.PARTIAL
+    assert outcome.run.error == "provider reported partial completion"
+    assert len(load_export_json(outcome)) == 1
+
+
 def test_resume_replays_durable_rows_enriches_pending_only_and_finishes_same_run(
     repository: SQLiteRepository,
     exporter: Exporter,
@@ -430,20 +515,34 @@ def test_resume_replays_durable_rows_enriches_pending_only_and_finishes_same_run
     assert repository.new_unique_count_for_run(run.id) == 3
 
 
-def test_resume_refuses_completed_runs_and_limits_new_records_to_remaining_daily_quota(
+def test_resume_rejects_running_and_completed_runs_before_provider_calls(
     repository: SQLiteRepository,
     exporter: Exporter,
     now: datetime,
 ) -> None:
+    running_run = repository.create_run("dentists", "HCMC", 1, now)
     previous_day = datetime(2026, 8, 18, 10, 0, tzinfo=UTC)
     completed_run = repository.create_run("dentists", "HCMC", 1, previous_day)
     repository.accept_candidate(completed_run.id, candidate_for(1), previous_day)
     repository.set_run_status(completed_run.id, RunStatus.COMPLETED, finished_at=previous_day)
 
-    service = MapsLeadService(repository, FakeProvider(), FakeEnricher(), exporter)
+    provider = FakeProvider()
+    service = MapsLeadService(repository, provider, FakeEnricher(), exporter)
+
+    with pytest.raises(ResumeNotAllowedError):
+        service.resume(running_run.id, now, _progress_sink([]))
 
     with pytest.raises(ResumeNotAllowedError):
         service.resume(completed_run.id, now, _progress_sink([]))
+
+    assert provider.call_log == []
+
+
+def test_resume_refuses_completed_runs_and_limits_new_records_to_remaining_daily_quota(
+    repository: SQLiteRepository,
+    exporter: Exporter,
+    now: datetime,
+) -> None:
 
     quota_seed_run = repository.create_run("dentists", "HCMC", DAILY_NEW_RECORD_LIMIT - 1, now)
     for index in range(2, DAILY_NEW_RECORD_LIMIT):
