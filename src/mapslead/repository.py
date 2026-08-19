@@ -8,9 +8,18 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict
 
 from mapslead.config import DAILY_NEW_RECORD_LIMIT, Settings
-from mapslead.errors import QuotaExceededError
+from mapslead.errors import (
+    CampaignBusinessTypeError,
+    CampaignNotFoundError,
+    CampaignRunAssignmentError,
+    InvalidCampaignError,
+    QuotaExceededError,
+)
 from mapslead.models import (
     Acceptance,
+    CampaignRecord,
+    CampaignSnapshot,
+    CampaignStatus,
     EnrichmentResult,
     EnrichmentStatus,
     ProviderCandidate,
@@ -18,9 +27,9 @@ from mapslead.models import (
     RunSnapshot,
     RunStatus,
 )
-from mapslead.normalize import build_identity
+from mapslead.normalize import build_identity, normalize_text, validate_campaign_slug
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _SCHEMA = """
 CREATE TABLE schema_version(version INTEGER NOT NULL);
 CREATE TABLE businesses(
@@ -44,7 +53,8 @@ CREATE TABLE runs(
     finished_at TEXT,
     provider_dir TEXT NOT NULL,
     error TEXT,
-    new_unique_count INTEGER NOT NULL DEFAULT 0 CHECK(new_unique_count >= 0)
+    new_unique_count INTEGER NOT NULL DEFAULT 0 CHECK(new_unique_count >= 0),
+    refresh_enrichment INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE run_businesses(
     run_id TEXT NOT NULL REFERENCES runs(id),
@@ -58,6 +68,38 @@ CREATE TABLE daily_quota(
     day TEXT PRIMARY KEY,
     accepted_count INTEGER NOT NULL CHECK(accepted_count BETWEEN 0 AND 1000)
 );
+CREATE TABLE campaigns(
+    slug TEXT PRIMARY KEY,
+    business_type TEXT NOT NULL,
+    normalized_business_type TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE campaign_runs(
+    campaign_slug TEXT NOT NULL REFERENCES campaigns(slug),
+    run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
+    attached_at TEXT NOT NULL,
+    PRIMARY KEY(campaign_slug, run_id)
+);
+CREATE TABLE campaign_businesses(
+    campaign_slug TEXT NOT NULL REFERENCES campaigns(slug),
+    business_id INTEGER NOT NULL REFERENCES businesses(id),
+    first_discovered_at TEXT NOT NULL,
+    last_discovered_at TEXT NOT NULL,
+    PRIMARY KEY(campaign_slug, business_id)
+);
+CREATE TABLE business_enrichment_cache(
+    business_id INTEGER PRIMARY KEY REFERENCES businesses(id),
+    normalized_website TEXT NOT NULL,
+    result_json TEXT NOT NULL,
+    completed_at TEXT NOT NULL
+);
+"""
+_RUN_SELECT = """
+SELECT
+    runs.*,
+    campaign_runs.campaign_slug AS campaign_slug
+FROM runs
+LEFT JOIN campaign_runs ON campaign_runs.run_id = runs.id
 """
 
 
@@ -102,9 +144,64 @@ class SQLiteRepository:
                 return
 
             row = connection.execute("SELECT version FROM schema_version").fetchone()
-            version = _require_row(row, "schema_version")[0]
-            if int(version) != _SCHEMA_VERSION:
+            version = int(_require_row(row, "schema_version")[0])
+            if version == _SCHEMA_VERSION:
+                return
+            if version != 1:
                 raise RuntimeError(f"unsupported schema version: {version}")
+
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    "ALTER TABLE runs ADD COLUMN refresh_enrichment INTEGER NOT NULL DEFAULT 0"
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE campaigns(
+                        slug TEXT PRIMARY KEY,
+                        business_type TEXT NOT NULL,
+                        normalized_business_type TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE campaign_runs(
+                        campaign_slug TEXT NOT NULL REFERENCES campaigns(slug),
+                        run_id TEXT NOT NULL UNIQUE REFERENCES runs(id),
+                        attached_at TEXT NOT NULL,
+                        PRIMARY KEY(campaign_slug, run_id)
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE campaign_businesses(
+                        campaign_slug TEXT NOT NULL REFERENCES campaigns(slug),
+                        business_id INTEGER NOT NULL REFERENCES businesses(id),
+                        first_discovered_at TEXT NOT NULL,
+                        last_discovered_at TEXT NOT NULL,
+                        PRIMARY KEY(campaign_slug, business_id)
+                    )
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE business_enrichment_cache(
+                        business_id INTEGER PRIMARY KEY REFERENCES businesses(id),
+                        normalized_website TEXT NOT NULL,
+                        result_json TEXT NOT NULL,
+                        completed_at TEXT NOT NULL
+                    )
+                    """
+                )
+                connection.execute("UPDATE schema_version SET version = ?", (_SCHEMA_VERSION,))
+                connection.commit()
+            except Exception:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
 
     def create_run(
         self,
@@ -112,46 +209,280 @@ class SQLiteRepository:
         location: str,
         requested_limit: int,
         now: datetime,
+        *,
+        campaign_slug: str | None = None,
+        refresh_enrichment: bool = False,
     ) -> RunRecord:
         run_id = uuid4().hex
         provider_dir = self._settings.data_dir / "runs" / run_id / "provider"
         provider_dir.mkdir(parents=True, exist_ok=True)
+        validated_campaign_slug = None if campaign_slug is None else validate_campaign_slug(campaign_slug)
 
         with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO runs(
-                    id,
-                    business_type,
-                    location_query,
-                    requested_limit,
-                    status,
-                    started_at,
-                    finished_at,
-                    provider_dir,
-                    error,
-                    new_unique_count
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    run_id,
-                    business,
-                    location,
-                    requested_limit,
-                    RunStatus.RUNNING.value,
-                    now.isoformat(),
-                    None,
-                    str(provider_dir),
-                    None,
-                    0,
-                ),
-            )
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                campaign_row = None
+                if validated_campaign_slug is not None:
+                    campaign_row = self._get_campaign_row(connection, validated_campaign_slug)
+                    self._ensure_business_type_matches(
+                        business_type=business,
+                        normalized_campaign_business_type=str(campaign_row["normalized_business_type"]),
+                    )
+
+                connection.execute(
+                    """
+                    INSERT INTO runs(
+                        id,
+                        business_type,
+                        location_query,
+                        requested_limit,
+                        status,
+                        started_at,
+                        finished_at,
+                        provider_dir,
+                        error,
+                        new_unique_count,
+                        refresh_enrichment
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        business,
+                        location,
+                        requested_limit,
+                        RunStatus.RUNNING.value,
+                        now.isoformat(),
+                        None,
+                        str(provider_dir),
+                        None,
+                        0,
+                        int(refresh_enrichment),
+                    ),
+                )
+                if validated_campaign_slug is not None:
+                    connection.execute(
+                        """
+                        INSERT INTO campaign_runs(campaign_slug, run_id, attached_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (validated_campaign_slug, run_id, now.isoformat()),
+                    )
+                connection.commit()
+            except Exception:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
 
         return self.get_run(run_id)
 
+    def create_campaign(self, slug: str, business: str, now: datetime) -> CampaignRecord:
+        validated_slug = validate_campaign_slug(slug)
+        normalized_business = normalize_text(business)
+        if not normalized_business:
+            raise InvalidCampaignError("campaign business type is required")
+
+        with self._connect() as connection:
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO campaigns(slug, business_type, normalized_business_type, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (validated_slug, business, normalized_business, now.isoformat()),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise InvalidCampaignError(f"campaign already exists: {validated_slug}") from exc
+
+        return self.get_campaign(validated_slug)
+
+    def get_campaign(self, slug: str) -> CampaignRecord:
+        validated_slug = validate_campaign_slug(slug)
+        with self._connect() as connection:
+            row = connection.execute("SELECT * FROM campaigns WHERE slug = ?", (validated_slug,)).fetchone()
+        return self._campaign_record_from_row(_require_row(row, f"campaign {validated_slug}"))
+
+    def attach_run(self, slug: str, run_id: str, now: datetime) -> CampaignRecord:
+        validated_slug = validate_campaign_slug(slug)
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                campaign_row = self._get_campaign_row(connection, validated_slug)
+                run = self._run_record_from_row(self._get_run_row(connection, run_id))
+                self._ensure_business_type_matches(
+                    business_type=run.business_type,
+                    normalized_campaign_business_type=str(campaign_row["normalized_business_type"]),
+                )
+
+                existing_campaign = connection.execute(
+                    "SELECT campaign_slug FROM campaign_runs WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                if existing_campaign is None:
+                    connection.execute(
+                        """
+                        INSERT INTO campaign_runs(campaign_slug, run_id, attached_at)
+                        VALUES (?, ?, ?)
+                        """,
+                        (validated_slug, run_id, now.isoformat()),
+                    )
+                elif str(existing_campaign["campaign_slug"]) != validated_slug:
+                    raise CampaignRunAssignmentError(
+                        f"run {run_id} is already attached to {existing_campaign['campaign_slug']}"
+                    )
+
+                membership_rows = connection.execute(
+                    """
+                    SELECT snapshot_json
+                    FROM run_businesses
+                    WHERE run_id = ?
+                    ORDER BY business_id
+                    """,
+                    (run_id,),
+                ).fetchall()
+                for membership_row in membership_rows:
+                    snapshot = RunSnapshot.model_validate_json(str(membership_row["snapshot_json"]))
+                    self._upsert_campaign_business(
+                        connection=connection,
+                        campaign_slug=validated_slug,
+                        business_id=snapshot.business_id,
+                        first_discovered_at=snapshot.first_seen_at,
+                        last_discovered_at=snapshot.last_seen_at,
+                    )
+                connection.commit()
+            except Exception:
+                if connection.in_transaction:
+                    connection.rollback()
+                raise
+
+        return self._campaign_record_from_row(campaign_row)
+
+    def campaign_for_run(self, run_id: str) -> CampaignRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT campaigns.*
+                FROM campaign_runs
+                INNER JOIN campaigns ON campaigns.slug = campaign_runs.campaign_slug
+                WHERE campaign_runs.run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._campaign_record_from_row(row)
+
+    def campaign_status(self, slug: str) -> CampaignStatus:
+        campaign = self.get_campaign(slug)
+        snapshots = self.campaign_snapshots(campaign.slug)
+        with self._connect() as connection:
+            run_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM campaign_runs WHERE campaign_slug = ?",
+                    (campaign.slug,),
+                ).fetchone()[0]
+            )
+            business_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM campaign_businesses WHERE campaign_slug = ?",
+                    (campaign.slug,),
+                ).fetchone()[0]
+            )
+
+        discovered_in = tuple(sorted({location for snapshot in snapshots for location in snapshot.discovered_in}))
+        completed_count = 0
+        failed_count = 0
+        skipped_count = 0
+        pending_count = 0
+        for snapshot in snapshots:
+            if not _has_http_website(snapshot.website):
+                skipped_count += 1
+            elif snapshot.enrichment_status is EnrichmentStatus.COMPLETED:
+                completed_count += 1
+            elif snapshot.enrichment_status is EnrichmentStatus.FAILED:
+                failed_count += 1
+            else:
+                pending_count += 1
+
+        return CampaignStatus(
+            campaign=campaign,
+            run_count=run_count,
+            business_count=business_count,
+            discovered_in=discovered_in,
+            completed_count=completed_count,
+            failed_count=failed_count,
+            skipped_count=skipped_count,
+            pending_count=pending_count,
+        )
+
+    def campaign_snapshots(self, slug: str) -> tuple[CampaignSnapshot, ...]:
+        campaign = self.get_campaign(slug)
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    campaign_businesses.business_id,
+                    campaign_businesses.first_discovered_at,
+                    campaign_businesses.last_discovered_at,
+                    businesses.canonical_json,
+                    run_businesses.snapshot_json
+                FROM campaign_businesses
+                INNER JOIN businesses ON businesses.id = campaign_businesses.business_id
+                INNER JOIN campaign_runs ON campaign_runs.campaign_slug = campaign_businesses.campaign_slug
+                INNER JOIN run_businesses
+                    ON run_businesses.run_id = campaign_runs.run_id
+                   AND run_businesses.business_id = campaign_businesses.business_id
+                WHERE campaign_businesses.campaign_slug = ?
+                ORDER BY campaign_businesses.business_id
+                """,
+                (campaign.slug,),
+            ).fetchall()
+
+        grouped: dict[int, list[sqlite3.Row]] = {}
+        for row in rows:
+            grouped.setdefault(int(row["business_id"]), []).append(row)
+
+        snapshots: list[CampaignSnapshot] = []
+        for business_id, membership_rows in grouped.items():
+            canonical = _CanonicalBusiness.model_validate_json(str(membership_rows[0]["canonical_json"]))
+            run_snapshots = [
+                RunSnapshot.model_validate_json(str(membership_row["snapshot_json"]))
+                for membership_row in membership_rows
+            ]
+            latest_snapshot = max(run_snapshots, key=lambda snapshot: (snapshot.last_seen_at, snapshot.run_id))
+            discovered_in = tuple(sorted({snapshot.location_query for snapshot in run_snapshots}))
+            snapshots.append(
+                CampaignSnapshot(
+                    business_id=business_id,
+                    campaign_id=campaign.slug,
+                    discovered_in=discovered_in,
+                    name=canonical.name or latest_snapshot.name,
+                    business_type=latest_snapshot.business_type,
+                    first_seen_at=_parse_datetime(str(membership_rows[0]["first_discovered_at"])),
+                    last_seen_at=_parse_datetime(str(membership_rows[0]["last_discovered_at"])),
+                    place_id=canonical.place_id,
+                    category=canonical.category,
+                    address=canonical.address,
+                    phone=canonical.phone,
+                    website=canonical.website,
+                    rating=canonical.rating,
+                    review_count=canonical.review_count,
+                    google_maps_url=canonical.google_maps_url,
+                    emails=latest_snapshot.emails,
+                    facebook_url=latest_snapshot.facebook_url,
+                    instagram_url=latest_snapshot.instagram_url,
+                    linkedin_url=latest_snapshot.linkedin_url,
+                    x_url=latest_snapshot.x_url,
+                    youtube_url=latest_snapshot.youtube_url,
+                    enrichment_status=latest_snapshot.enrichment_status,
+                    enrichment_error=latest_snapshot.enrichment_error,
+                )
+            )
+
+        return tuple(sorted(snapshots, key=_campaign_snapshot_sort_key))
+
     def get_run(self, run_id: str) -> RunRecord:
         with self._connect() as connection:
-            row = connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+            row = connection.execute(f"{_RUN_SELECT} WHERE runs.id = ?", (run_id,)).fetchone()
         return self._run_record_from_row(_require_row(row, f"run {run_id}"))
 
     def remaining_quota(self, now: datetime) -> int:
@@ -207,6 +538,14 @@ class SQLiteRepository:
                     first_seen_at=first_seen_at,
                     last_seen_at=now,
                 )
+                if run.campaign_slug is not None:
+                    self._upsert_campaign_business(
+                        connection=connection,
+                        campaign_slug=run.campaign_slug,
+                        business_id=business_id,
+                        first_discovered_at=snapshot.first_seen_at,
+                        last_discovered_at=now,
+                    )
                 connection.commit()
             except Exception:
                 if connection.in_transaction:
@@ -234,10 +573,7 @@ class SQLiteRepository:
                 """,
                 (run_id, EnrichmentStatus.COMPLETED.value),
             ).fetchall()
-        snapshots = tuple(
-            self._snapshot_for_pending_enrichment(row)
-            for row in rows
-        )
+        snapshots = tuple(self._snapshot_for_pending_enrichment(row) for row in rows)
         return tuple(snapshot for snapshot in snapshots if _has_http_website(snapshot.website))
 
     def save_enrichment(
@@ -338,7 +674,7 @@ class SQLiteRepository:
             )
             if connection.total_changes == 0:
                 raise KeyError(f"run {run_id} not found")
-            row = connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+            row = connection.execute(f"{_RUN_SELECT} WHERE runs.id = ?", (run_id,)).fetchone()
         return self._run_record_from_row(_require_row(row, f"run {run_id}"))
 
     def snapshots_for_run(self, run_id: str) -> tuple[RunSnapshot, ...]:
@@ -366,7 +702,16 @@ class SQLiteRepository:
         connection.execute(f"PRAGMA busy_timeout={self._busy_timeout_ms}")
         return connection
 
+    def _campaign_record_from_row(self, row: sqlite3.Row) -> CampaignRecord:
+        return CampaignRecord(
+            slug=str(row["slug"]),
+            business_type=str(row["business_type"]),
+            created_at=_parse_datetime(str(row["created_at"])),
+        )
+
     def _run_record_from_row(self, row: sqlite3.Row) -> RunRecord:
+        campaign_slug = None if row["campaign_slug"] is None else str(row["campaign_slug"])
+        refresh_enrichment = bool(int(row["refresh_enrichment"]))
         return RunRecord(
             id=str(row["id"]),
             business_type=str(row["business_type"]),
@@ -380,13 +725,27 @@ class SQLiteRepository:
             provider_dir=Path(str(row["provider_dir"])),
             error=None if row["error"] is None else str(row["error"]),
             new_unique_count=int(row["new_unique_count"]),
+            campaign_slug=campaign_slug,
+            refresh_enrichment=refresh_enrichment,
         )
 
     def _quota_day(self, now: datetime) -> str:
         return now.astimezone(self._settings.timezone).date().isoformat()
 
+    def _get_campaign_row(self, connection: sqlite3.Connection, slug: str) -> sqlite3.Row:
+        row: sqlite3.Row | None = connection.execute(
+            "SELECT * FROM campaigns WHERE slug = ?",
+            (slug,),
+        ).fetchone()
+        if row is None:
+            raise CampaignNotFoundError(f"campaign {slug} not found")
+        return row
+
     def _get_run_row(self, connection: sqlite3.Connection, run_id: str) -> sqlite3.Row:
-        row = connection.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+        row: sqlite3.Row | None = connection.execute(
+            f"{_RUN_SELECT} WHERE runs.id = ?",
+            (run_id,),
+        ).fetchone()
         return _require_row(row, f"run {run_id}")
 
     def _resolve_business_id(
@@ -404,6 +763,15 @@ class SQLiteRepository:
             if key in by_alias:
                 return by_alias[key]
         return None
+
+    def _ensure_business_type_matches(
+        self,
+        *,
+        business_type: str,
+        normalized_campaign_business_type: str,
+    ) -> None:
+        if normalize_text(business_type) != normalized_campaign_business_type:
+            raise CampaignBusinessTypeError("run business type does not match campaign")
 
     def _ensure_quota_available(self, connection: sqlite3.Connection, now: datetime) -> None:
         day = self._quota_day(now)
@@ -589,6 +957,35 @@ class SQLiteRepository:
         )
         return snapshot
 
+    def _upsert_campaign_business(
+        self,
+        *,
+        connection: sqlite3.Connection,
+        campaign_slug: str,
+        business_id: int,
+        first_discovered_at: datetime,
+        last_discovered_at: datetime,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO campaign_businesses(
+                campaign_slug,
+                business_id,
+                first_discovered_at,
+                last_discovered_at
+            ) VALUES (?, ?, ?, ?)
+            ON CONFLICT(campaign_slug, business_id) DO UPDATE SET
+                first_discovered_at = MIN(first_discovered_at, excluded.first_discovered_at),
+                last_discovered_at = MAX(last_discovered_at, excluded.last_discovered_at)
+            """,
+            (
+                campaign_slug,
+                business_id,
+                first_discovered_at.isoformat(),
+                last_discovered_at.isoformat(),
+            ),
+        )
+
     def _snapshot_for_pending_enrichment(self, row: sqlite3.Row) -> RunSnapshot:
         snapshot = RunSnapshot.model_validate_json(str(row["snapshot_json"]))
         if _has_http_website(snapshot.website):
@@ -599,6 +996,14 @@ class SQLiteRepository:
             return snapshot
 
         return snapshot.model_copy(update={"website": canonical.website})
+
+
+def _campaign_snapshot_sort_key(snapshot: CampaignSnapshot) -> tuple[str, str, int]:
+    return (
+        normalize_text(snapshot.name),
+        normalize_text(snapshot.address),
+        snapshot.business_id,
+    )
 
 
 def _has_http_website(value: str | None) -> bool:

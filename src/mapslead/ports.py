@@ -6,6 +6,9 @@ from typing import Protocol
 
 from mapslead.models import (
     Acceptance,
+    CampaignRecord,
+    CampaignSnapshot,
+    CampaignStatus,
     EnrichmentResult,
     ExportPaths,
     ProgressEvent,
@@ -64,7 +67,22 @@ class RepositoryPort(Protocol):
         location: str,
         requested_limit: int,
         now: datetime,
+        *,
+        campaign_slug: str | None = None,
+        refresh_enrichment: bool = False,
     ) -> RunRecord: ...
+
+    def create_campaign(self, slug: str, business: str, now: datetime) -> CampaignRecord: ...
+
+    def get_campaign(self, slug: str) -> CampaignRecord: ...
+
+    def attach_run(self, slug: str, run_id: str, now: datetime) -> CampaignRecord: ...
+
+    def campaign_for_run(self, run_id: str) -> CampaignRecord | None: ...
+
+    def campaign_status(self, slug: str) -> CampaignStatus: ...
+
+    def campaign_snapshots(self, slug: str) -> Sequence[CampaignSnapshot]: ...
 
     def get_run(self, run_id: str) -> RunRecord: ...
 

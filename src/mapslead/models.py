@@ -69,12 +69,51 @@ class EnrichmentResult(FrozenModel):
     error: str | None = None
 
 
+class CampaignRecord(FrozenModel):
+    slug: str
+    business_type: str
+    created_at: datetime
+
+
+class EnrichmentCacheEntry(FrozenModel):
+    business_id: int
+    normalized_website: str
+    result: EnrichmentResult
+    completed_at: datetime
+
+
 class RunSnapshot(FrozenModel):
     business_id: int
     run_id: str
     name: str
     business_type: str
     location_query: str
+    first_seen_at: datetime
+    last_seen_at: datetime
+    place_id: str | None = None
+    category: str | None = None
+    address: str | None = None
+    phone: str | None = None
+    website: str | None = None
+    rating: float | None = None
+    review_count: int | None = None
+    google_maps_url: str | None = None
+    emails: tuple[str, ...] = ()
+    facebook_url: str | None = None
+    instagram_url: str | None = None
+    linkedin_url: str | None = None
+    x_url: str | None = None
+    youtube_url: str | None = None
+    enrichment_status: EnrichmentStatus = EnrichmentStatus.PENDING
+    enrichment_error: str | None = None
+
+
+class CampaignSnapshot(FrozenModel):
+    business_id: int
+    campaign_id: str
+    discovered_in: tuple[str, ...]
+    name: str
+    business_type: str
     first_seen_at: datetime
     last_seen_at: datetime
     place_id: str | None = None
@@ -103,6 +142,17 @@ class Acceptance(FrozenModel):
     snapshot: RunSnapshot | None = None
 
 
+class CampaignStatus(FrozenModel):
+    campaign: CampaignRecord
+    run_count: int = Field(ge=0)
+    business_count: int = Field(ge=0)
+    discovered_in: tuple[str, ...] = ()
+    completed_count: int = Field(ge=0)
+    failed_count: int = Field(ge=0)
+    skipped_count: int = Field(ge=0)
+    pending_count: int = Field(ge=0)
+
+
 class RunRecord(FrozenModel):
     id: str
     business_type: str
@@ -114,6 +164,8 @@ class RunRecord(FrozenModel):
     provider_dir: Path
     error: str | None = None
     new_unique_count: int = Field(default=0, ge=0)
+    campaign_slug: str | None = None
+    refresh_enrichment: bool = False
 
 
 class ExportPaths(FrozenModel):

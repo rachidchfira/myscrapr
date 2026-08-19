@@ -7,9 +7,11 @@ from urllib.parse import urlsplit
 from tld import get_tld
 from tld.exceptions import TldBadUrl, TldDomainNotFound
 
+from mapslead.errors import InvalidCampaignError
 from mapslead.models import Identity, ProviderCandidate
 
 _WHITESPACE_RE = re.compile(r"\s+")
+_CAMPAIGN_SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
 def normalize_text(value: str | None) -> str:
@@ -28,6 +30,12 @@ def normalize_phone(value: str | None) -> str:
     if has_plus and digits:
         return f"+{digits}"
     return digits
+
+
+def validate_campaign_slug(slug: str) -> str:
+    if 1 <= len(slug) <= 64 and _CAMPAIGN_SLUG_RE.fullmatch(slug):
+        return slug
+    raise InvalidCampaignError(f"invalid campaign slug: {slug}")
 
 
 def registrable_domain(value: str | None) -> str | None:
