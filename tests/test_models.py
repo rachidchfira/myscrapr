@@ -19,6 +19,12 @@ def test_place_id_is_preferred_identity() -> None:
     assert build_identity(candidate).primary_key == "place:ChIJ-123"
 
 
+@pytest.mark.parametrize("website", ["example.com", "www.example.com"])
+def test_bare_domain_website_is_accepted_for_identity(website: str) -> None:
+    candidate = ProviderCandidate(name="Example Dental", website=website)
+    assert build_identity(candidate).primary_key == "name_domain:example dental|example.com"
+
+
 @pytest.mark.parametrize(
     ("candidate", "expected"),
     [

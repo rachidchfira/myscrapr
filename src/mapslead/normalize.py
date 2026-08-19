@@ -77,7 +77,12 @@ def _normalized_hostname(value: str | None) -> str | None:
     if trimmed is None:
         return None
     parsed = urlsplit(trimmed)
-    hostname = parsed.hostname.casefold() if parsed.hostname is not None else None
+    hostname = parsed.hostname
+    if hostname is None:
+        parsed = urlsplit(f"https://{trimmed}")
+        hostname = parsed.hostname
+    if hostname is not None:
+        hostname = hostname.casefold()
     if hostname is None:
         return None
     return hostname.rstrip(".")

@@ -55,3 +55,75 @@ Success: no issues found in 6 source files
 
 - `pyproject.toml` intentionally freezes the future CLI entry point at `mapslead.cli:app`, but `src/mapslead/cli.py` does not exist yet because it belongs to Task 7. Editable install succeeds today, but command execution cannot be validated until that module is implemented.
 - `ProviderCandidate` currently models the Maps fields named in the design spec. If Task 3 needs additional provider-only raw columns, they should be added there only if the later tests prove the current frozen shape is insufficient.
+
+## Fix round 1: bare-domain website normalization
+
+### Scope and execution boundary
+
+- Changed `src/mapslead/normalize.py` and `tests/test_models.py`.
+- Execution boundary analyzed: website-to-hostname normalization inside `build_identity()` for `name_domain` fallback key generation.
+
+### Concrete issue observed
+
+- Bare-domain website values like `example.com` and `www.example.com` were rejected.
+- Root cause: `_normalized_hostname()` trusted `urlsplit(trimmed).hostname` only. Without a scheme, `urlsplit()` places the domain in the path component, leaving `hostname` as `None`, so `registrable_domain()` returned `None` and `build_identity()` raised `ValueError("candidate identity is incomplete")`.
+
+### Smallest safe fix
+
+- Retried parsing with an implied `https://` scheme only when the first `urlsplit()` call produced no hostname.
+- This preserves existing behavior for already-qualified URLs and fixes only the bare-domain parsing gap required by the review.
+
+### RED/GREEN evidence
+
+```text
+$ .venv/bin/python -m pytest tests/test_models.py -q -k bare_domain_website
+FF                                                                       [100%]
+=================================== FAILURES ===================================
+________ test_bare_domain_website_is_accepted_for_identity[example.com] ________
+E           ValueError: candidate identity is incomplete
+
+______ test_bare_domain_website_is_accepted_for_identity[www.example.com] ______
+E           ValueError: candidate identity is incomplete
+
+=========================== short test summary info ============================
+FAILED tests/test_models.py::test_bare_domain_website_is_accepted_for_identity[example.com]
+FAILED tests/test_models.py::test_bare_domain_website_is_accepted_for_identity[www.example.com]
+2 failed, 8 deselected in 0.12s
+```
+
+```text
+$ .venv/bin/python -m pytest tests/test_models.py -q -k bare_domain_website
+..                                                                       [100%]
+2 passed, 8 deselected in 0.14s
+```
+
+```text
+$ .venv/bin/python -m pytest tests/test_models.py -q
+..........                                                               [100%]
+10 passed in 0.15s
+```
+
+```text
+$ .venv/bin/python -m ruff check src/mapslead tests/test_models.py
+All checks passed!
+```
+
+```text
+$ .venv/bin/python -m mypy src/mapslead
+Success: no issues found in 6 source files
+```
+
+### Exact commands run
+
+```text
+.venv/bin/python -m pytest tests/test_models.py -q -k bare_domain_website
+.venv/bin/python -m pytest tests/test_models.py -q
+.venv/bin/python -m ruff check src/mapslead tests/test_models.py
+.venv/bin/python -m mypy src/mapslead
+```
+
+### Validation performed
+
+- Primary success path: `build_identity()` now accepts both `example.com` and `www.example.com` and produces `name_domain:example dental|example.com`.
+- Representative failure path retained: candidates without any complete identity still raise `ValueError`, so the rejection boundary remains explicit to repository callers.
+- Integration boundary: the change is import-local to `normalize.py` and does not alter model, protocol, or package metadata contracts used by later tasks.
