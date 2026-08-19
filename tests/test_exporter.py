@@ -5,13 +5,14 @@ import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
 
 import pytest
 from openpyxl import load_workbook
 
 from mapslead.config import Settings
 from mapslead.errors import ExportError
-from mapslead.exporter import _CSV_FIELDNAMES, Exporter
+from mapslead.exporter import _CSV_FIELDNAMES, _WORKBOOK_TIMESTAMP, Exporter
 from mapslead.models import EnrichmentStatus, RunSnapshot
 
 
@@ -289,6 +290,31 @@ def test_export_run_restores_existing_group_when_xlsx_replace_fails(
         "results.json",
         "results.xlsx",
     ]
+
+
+def test_export_run_writes_canonical_xlsx_zip_metadata(
+    settings: Settings,
+    run_id: str,
+    snapshots: tuple[RunSnapshot, ...],
+) -> None:
+    repository = StubRepository({run_id: snapshots})
+    exporter = Exporter(repository, settings)
+
+    paths = exporter.export_run(run_id)
+
+    with ZipFile(io.BytesIO(paths.xlsx_path.read_bytes())) as archive:
+        entry_names = [entry.filename for entry in archive.infolist()]
+        entry_timestamps = {entry.filename: entry.date_time for entry in archive.infolist()}
+        compression_types = {entry.filename: entry.compress_type for entry in archive.infolist()}
+        core_properties = archive.read("docProps/core.xml").decode("utf-8")
+
+    assert entry_names == sorted(entry_names)
+    assert entry_timestamps == {
+        entry_name: _WORKBOOK_TIMESTAMP.timetuple()[:6] for entry_name in entry_names
+    }
+    assert compression_types == {entry_name: ZIP_DEFLATED for entry_name in entry_names}
+    assert "<dcterms:created xsi:type=\"dcterms:W3CDTF\">2000-01-01T00:00:00Z</dcterms:created>" in core_properties
+    assert "<dcterms:modified xsi:type=\"dcterms:W3CDTF\">2000-01-01T00:00:00Z</dcterms:modified>" in core_properties
 
 
 @pytest.mark.parametrize(

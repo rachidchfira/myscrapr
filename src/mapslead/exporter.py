@@ -4,12 +4,14 @@ import csv
 import io
 import json
 import os
+import re
 import uuid
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 from openpyxl import Workbook
 from openpyxl.cell.cell import Cell
@@ -47,7 +49,12 @@ _CSV_FIELDNAMES = (
 )
 
 _WORKBOOK_TIMESTAMP = datetime(2000, 1, 1, 0, 0, 0, tzinfo=UTC)
+_ZIP_ENTRY_TIMESTAMP = _WORKBOOK_TIMESTAMP.timetuple()[:6]
+_WORKBOOK_TIMESTAMP_XML = _WORKBOOK_TIMESTAMP.strftime("%Y-%m-%dT%H:%M:%SZ")
 _MAX_COLUMN_WIDTH = 60
+_CORE_XML_MODIFIED_PATTERN = re.compile(
+    rb"(<dcterms:modified xsi:type=\"dcterms:W3CDTF\">)([^<]+)(</dcterms:modified>)"
+)
 type _CellValue = str | int | float | None
 
 
@@ -277,7 +284,46 @@ def _build_xlsx_document[
 
     buffer = io.BytesIO()
     workbook.save(buffer)
-    return buffer.getvalue()
+    return _canonicalize_zip_archive(buffer.getvalue())
+
+
+def _canonicalize_zip_archive(document: bytes) -> bytes:
+    source_buffer = io.BytesIO(document)
+    output_buffer = io.BytesIO()
+    with ZipFile(source_buffer) as source_archive:
+        entries = {
+            entry.filename: _canonicalize_zip_payload(entry.filename, source_archive.read(entry.filename))
+            for entry in sorted(source_archive.infolist(), key=lambda entry: entry.filename)
+        }
+
+    with ZipFile(output_buffer, "w", compression=ZIP_DEFLATED, compresslevel=9) as output_archive:
+        output_archive.comment = b""
+        for filename, payload in entries.items():
+            zip_info = ZipInfo(filename=filename, date_time=_ZIP_ENTRY_TIMESTAMP)
+            zip_info.compress_type = ZIP_DEFLATED
+            zip_info.create_system = 0
+            zip_info.create_version = 20
+            zip_info.extract_version = 20
+            zip_info.flag_bits = 0
+            zip_info.volume = 0
+            zip_info.internal_attr = 0
+            zip_info.external_attr = 0
+            zip_info.extra = b""
+            zip_info.comment = b""
+            output_archive.writestr(zip_info, payload, compress_type=ZIP_DEFLATED, compresslevel=9)
+
+    return output_buffer.getvalue()
+
+
+def _canonicalize_zip_payload(filename: str, payload: bytes) -> bytes:
+    if filename != "docProps/core.xml":
+        return payload
+
+    return _CORE_XML_MODIFIED_PATTERN.sub(
+        rb"\g<1>" + _WORKBOOK_TIMESTAMP_XML.encode("ascii") + rb"\g<3>",
+        payload,
+        count=1,
+    )
 
 
 def _assign_cell_value(cell: Cell, value: _CellValue) -> None:
