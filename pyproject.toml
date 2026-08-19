@@ -11,6 +11,7 @@ dependencies = [
     "typer>=0.16,<1",
     "pydantic>=2.11,<3",
     "platformdirs>=4.3,<5",
+    "tld>=0.13.2,<1",
 ]
 
 [project.optional-dependencies]

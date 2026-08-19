@@ -31,11 +31,14 @@ Implemented one new CLI module instead of widening service or repository APIs:
 
 - Added a Typer app with `scrape`, `quota`, `resume`, and `export`.
 - Kept dependency injection at `build_service(settings)` so tests can replace the runtime cleanly.
-- Added a focused `OperatorPrerequisiteChecker` that verifies:
+- The initial implementation added an `OperatorPrerequisiteChecker` that verified:
   - `docker version`
   - `docker image inspect gosom/google-maps-scraper`
   - `scrapling.fetchers.Fetcher` import
   - Playwright Chromium executable path exists
+- The Scrapling/Chromium checks were removed in review fix round 1 because the shipped
+  enrichment path uses the built-in safe HTTP transport; the final checker requires only
+  Docker and the provider image.
 - Routed expected operator failures to concise messages and stable exit codes instead of tracebacks.
 - Rendered concise progress lines and final export paths.
 - Added an offline end-to-end CLI test using the real repository, service, exporter, fake provider, and fixture fetcher.
